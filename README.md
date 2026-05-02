@@ -36,14 +36,13 @@ The smoke test builds the server, starts it on port `8097`, checks the health en
 
 ```text
 .
-├── CMakeLists.txt
-├── public
-│   ├── app.js
-│   ├── index.html
-│   └── styles.css
-├── src
-│   └── main.cpp
-└── tests
-    └── smoke.sh
+|-- CMakeLists.txt
+|-- public
+|   |-- app.js
+|   |-- index.html
+|   `-- styles.css
+|-- src
+|   `-- main.cpp
+`-- tests
+    `-- smoke.sh
 ```
-
