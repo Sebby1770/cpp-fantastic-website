@@ -3,37 +3,54 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AsterForge - C++ Fantastic Website</title>
+  <title>AsterForge - Native C++ Observatory</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
   <main class="app-shell">
-    <aside class="control-rail" aria-label="AsterForge controls">
+    <aside class="command-rail" aria-label="AsterForge controls">
       <div class="brand-lockup">
         <span class="brand-mark" aria-hidden="true"></span>
         <div>
-          <p class="eyebrow">C++ Web App</p>
+          <p class="eyebrow">Native C++</p>
           <h1>AsterForge</h1>
         </div>
       </div>
 
-      <section class="panel compact">
+      <section class="panel status-panel">
+        <div>
+          <p class="eyebrow">Server</p>
+          <h2>Live Observatory</h2>
+        </div>
+        <span id="serverStatus" class="status-pill">checking</span>
+      </section>
+
+      <section class="panel">
         <div class="panel-heading">
           <h2>Mode</h2>
-          <span id="serverStatus" class="status-pill">checking</span>
+          <span id="modeBadge">Orbit</span>
         </div>
         <div class="segmented" role="group" aria-label="Mode">
-          <button class="mode-button active" data-mode="pulse" type="button">Pulse</button>
-          <button class="mode-button" data-mode="route" type="button">Route</button>
+          <button class="mode-button active" data-mode="orbit" type="button">Orbit</button>
+          <button class="mode-button" data-mode="bloom" type="button">Bloom</button>
           <button class="mode-button" data-mode="forge" type="button">Forge</button>
+          <button class="mode-button" data-mode="night" type="button">Night</button>
         </div>
       </section>
 
       <section class="panel">
         <div class="panel-heading">
-          <h2>Inputs</h2>
+          <h2>Presets</h2>
+          <span id="presetsStatus">loading</span>
+        </div>
+        <div id="presetsList" class="preset-list"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <h2>Signal</h2>
           <button id="randomizeSeed" class="icon-button" type="button" aria-label="Randomize seed" title="Randomize seed">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17 3h4v4h-2V6.4l-4.7 4.7-1.4-1.4L17.6 5H17V3z"></path><path d="M3 7.5h3.6c1.5 0 2.8.8 3.6 2l.7 1 .7-1c.8-1.2 2.1-2 3.6-2H17v2h-1.8c-.8 0-1.5.4-2 1.1l-1.1 1.6 1.1 1.6c.5.7 1.2 1.1 2 1.1H17v2h-1.8c-1.5 0-2.8-.8-3.6-2l-.7-1-.7 1c-.8 1.2-2.1 2-3.6 2H3v-2h3.6c.8 0 1.5-.4 2-1.1l1.1-1.6-1.1-1.6c-.5-.7-1.2-1.1-2-1.1H3v-2z"></path><path d="M19 17.6V17h2v4h-4v-2h.6l-3.2-3.2 1.4-1.4L19 17.6z"></path></svg>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 3h5v5h-2V6.41l-4.47 4.48-1.42-1.42L17.59 5H16V3z"></path><path d="M4 7h3.4c1.39 0 2.69.69 3.47 1.84l2.26 3.32A4.19 4.19 0 0 0 16.6 14H20v2h-3.4a6.19 6.19 0 0 1-5.13-2.72L9.21 9.96A2.19 2.19 0 0 0 7.4 9H4V7z"></path><path d="M4 15h3.4c.73 0 1.41-.36 1.81-.96l.62-.91 1.21 1.78-.17.25A4.19 4.19 0 0 1 7.4 17H4v-2z"></path><path d="M19 17.59V16h2v5h-5v-2h1.59l-3.1-3.1 1.41-1.41L19 17.59z"></path></svg>
           </button>
         </div>
         <label class="field">
@@ -45,19 +62,29 @@
           <input id="intensityInput" type="range" min="1" max="100" value="68">
         </label>
         <label class="field">
-          <span>Tempo <output id="tempoValue">42</output></span>
-          <input id="tempoInput" type="range" min="1" max="100" value="42">
+          <span>Tempo <output id="tempoValue">54</output></span>
+          <input id="tempoInput" type="range" min="1" max="100" value="54">
         </label>
-        <label class="toggle-row">
-          <input id="gridToggle" type="checkbox" checked>
-          <span>Grid</span>
+        <label class="field">
+          <span>Density <output id="densityValue">72</output></span>
+          <input id="densityInput" type="range" min="1" max="100" value="72">
         </label>
-        <label class="toggle-row">
-          <input id="trailToggle" type="checkbox" checked>
-          <span>Trails</span>
-        </label>
+        <div class="toggles">
+          <label class="toggle-row">
+            <input id="gridToggle" type="checkbox" checked>
+            <span>Grid</span>
+          </label>
+          <label class="toggle-row">
+            <input id="trailToggle" type="checkbox" checked>
+            <span>Trails</span>
+          </label>
+          <label class="toggle-row">
+            <input id="motionToggle" type="checkbox" checked>
+            <span>Motion</span>
+          </label>
+        </div>
         <button id="generateButton" class="primary-action" type="button">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l1.8 6.1L20 10l-6.2 1.9L12 18l-1.8-6.1L4 10l6.2-1.9L12 2z"></path><path d="M19 15l.8 2.7L22.5 18l-2.7.8L19 21.5l-.8-2.7-2.7-.8 2.7-.8L19 15z"></path></svg>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l1.75 6.25L20 10l-6.25 1.75L12 18l-1.75-6.25L4 10l6.25-1.75L12 2z"></path><path d="M19 15l.7 2.3L22 18l-2.3.7L19 21l-.7-2.3L16 18l2.3-.7L19 15z"></path></svg>
           Generate
         </button>
       </section>
@@ -69,23 +96,34 @@
         </div>
         <div id="swatches" class="swatches" aria-label="Generated palette"></div>
       </section>
+
+      <section class="panel snapshot-panel">
+        <div class="panel-heading">
+          <h2>Snapshots</h2>
+          <button id="saveSnapshot" class="text-button" type="button">Save</button>
+        </div>
+        <div id="snapshotList" class="snapshot-list"></div>
+      </section>
     </aside>
 
     <section class="stage" aria-label="Interactive constellation workspace">
-      <canvas id="skyCanvas" aria-label="Generated constellation"></canvas>
+      <canvas id="skyCanvas" aria-label="Generated mission constellation"></canvas>
       <div class="stage-topbar">
         <div>
-          <p class="eyebrow">Mission</p>
+          <p class="eyebrow" id="weatherLabel">Mission</p>
           <h2 id="missionName">Loading</h2>
         </div>
-        <div class="topbar-actions">
+        <div class="stage-actions">
           <button id="copyButton" class="glass-button" type="button">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7a3 3 0 0 1 3-3h6a3 3 0 0 1 3 3v6a3 3 0 0 1-3 3h-1v1a3 3 0 0 1-3 3H7a3 3 0 0 1-3-3v-6a3 3 0 0 1 3-3h1V7zm3-1a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V7a1 1 0 0 0-1-1h-6zM7 10a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1v-1h-3a3 3 0 0 1-3-3v-3H7z"></path></svg>
             Copy JSON
           </button>
+          <button id="copyLinkButton" class="glass-button" type="button">Copy Link</button>
+          <button id="downloadPngButton" class="glass-button" type="button">Save PNG</button>
         </div>
       </div>
       <div id="metricStrip" class="metric-strip" aria-label="Live metrics"></div>
+      <p id="signature" class="signature">waiting for signal</p>
     </section>
 
     <aside class="intel-panel" aria-label="Generated mission details">
@@ -97,8 +135,8 @@
 
       <section class="panel">
         <div class="panel-heading">
-          <h2>Priorities</h2>
-          <span id="modeBadge">Pulse</span>
+          <h2>Priority Stack</h2>
+          <span id="nodeCount">0 nodes</span>
         </div>
         <ol id="priorityList" class="priority-list"></ol>
       </section>
@@ -106,13 +144,20 @@
       <section class="panel">
         <div class="panel-heading">
           <h2>Waypoints</h2>
-          <span>today</span>
+          <span id="routeCount">0 routes</span>
         </div>
         <div id="waypoints" class="waypoints"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <h2>Build Notes</h2>
+          <span>fresh</span>
+        </div>
+        <div id="notesList" class="notes-list"></div>
       </section>
     </aside>
   </main>
   <script src="/app.js"></script>
 </body>
 </html>
-
