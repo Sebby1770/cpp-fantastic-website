@@ -1,6 +1,10 @@
 const state = {
   mode: "pulse",
   mission: null,
+  paletteId: null,
+  palettes: [],
+  constellation: null,
+  constellationSeed: Math.floor(Math.random() * 10000),
   pointer: { x: 0.5, y: 0.5, active: false },
   time: 0
 };
@@ -8,6 +12,10 @@ const state = {
 const elements = {
   canvas: document.querySelector("#skyCanvas"),
   serverStatus: document.querySelector("#serverStatus"),
+  uptimeValue: document.querySelector("#uptimeValue"),
+  requestCount: document.querySelector("#requestCount"),
+  serverVersion: document.querySelector("#serverVersion"),
+  serverMetrics: document.querySelector("#serverMetrics"),
   missionName: document.querySelector("#missionName"),
   missionTagline: document.querySelector("#missionTagline"),
   updatedAt: document.querySelector("#updatedAt"),
@@ -20,12 +28,14 @@ const elements = {
   trails: document.querySelector("#trailToggle"),
   generate: document.querySelector("#generateButton"),
   randomizeSeed: document.querySelector("#randomizeSeed"),
+  reseedConstellation: document.querySelector("#reseedConstellation"),
   copy: document.querySelector("#copyButton"),
   metrics: document.querySelector("#metricStrip"),
   priorities: document.querySelector("#priorityList"),
   waypoints: document.querySelector("#waypoints"),
   swatches: document.querySelector("#swatches"),
   paletteName: document.querySelector("#paletteName"),
+  palettePicker: document.querySelector("#palettePicker"),
   modeBadge: document.querySelector("#modeBadge")
 };
 
@@ -44,6 +54,16 @@ function modeTitle(value) {
   return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
+function formatUptime(seconds) {
+  const s = Math.max(0, Number(seconds) || 0);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  if (m < 60) return `${m}m ${rem}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
+
 function apiUrl() {
   const params = new URLSearchParams({
     seed: elements.seed.value || "sebby",
@@ -51,6 +71,9 @@ function apiUrl() {
     intensity: elements.intensity.value,
     tempo: elements.tempo.value
   });
+  if (state.paletteId) {
+    params.set("palette", state.paletteId);
+  }
   return `/api/mission?${params}`;
 }
 
@@ -58,11 +81,93 @@ async function checkHealth() {
   try {
     const response = await fetch("/api/health");
     if (!response.ok) throw new Error("health check failed");
+    const data = await response.json();
     elements.serverStatus.textContent = "online";
     elements.serverStatus.classList.add("online");
+    if (elements.uptimeValue) {
+      elements.uptimeValue.textContent = formatUptime(data.uptime_seconds);
+    }
+    if (elements.requestCount) {
+      elements.requestCount.textContent = String(data.request_count ?? "—");
+    }
+    if (elements.serverVersion) {
+      elements.serverVersion.textContent = data.version || "—";
+    }
   } catch {
     elements.serverStatus.textContent = "offline";
     elements.serverStatus.classList.remove("online");
+  }
+}
+
+async function loadMetrics() {
+  if (!elements.serverMetrics) return;
+  try {
+    const response = await fetch("/api/metrics");
+    if (!response.ok) throw new Error("metrics failed");
+    const data = await response.json();
+    const paths = Object.entries(data.by_path || {})
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 6)
+      .map(([path, count]) => `<li><code>${path}</code> <strong>${count}</strong></li>`)
+      .join("");
+    elements.serverMetrics.innerHTML = `
+      <p class="metrics-summary">
+        <span>total <strong>${data.total_requests}</strong></span>
+        <span>up <strong>${formatUptime(data.uptime_seconds)}</strong></span>
+      </p>
+      <ul class="path-metrics">${paths || "<li>No traffic yet</li>"}</ul>
+    `;
+  } catch {
+    elements.serverMetrics.textContent = "Metrics unavailable";
+  }
+}
+
+async function loadPalettes() {
+  if (!elements.palettePicker) return;
+  try {
+    const response = await fetch("/api/palettes");
+    if (!response.ok) throw new Error("palettes failed");
+    const data = await response.json();
+    state.palettes = data.palettes || [];
+    renderPalettePicker();
+  } catch (error) {
+    console.warn("palettes endpoint unavailable", error);
+  }
+}
+
+function renderPalettePicker() {
+  if (!elements.palettePicker || !state.palettes.length) return;
+  elements.palettePicker.innerHTML = state.palettes.map((palette) => {
+    const active = state.paletteId === palette.id ? " active" : "";
+    const chips = (palette.colors || []).slice(0, 6)
+      .map((color) => `<i style="background:${color}"></i>`)
+      .join("");
+    return `
+      <button type="button" class="palette-option${active}" data-palette-id="${palette.id}" role="option" aria-selected="${state.paletteId === palette.id}">
+        <span class="palette-option-name">${palette.name}</span>
+        <span class="palette-option-chips">${chips}</span>
+      </button>
+    `;
+  }).join("");
+
+  elements.palettePicker.querySelectorAll(".palette-option").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.paletteId = button.dataset.paletteId;
+      renderPalettePicker();
+      loadMission();
+    });
+  });
+}
+
+async function loadConstellation() {
+  try {
+    const points = 20 + Math.floor(Number(elements.intensity.value) / 5);
+    const response = await fetch(`/api/constellation?seed=${state.constellationSeed}&points=${points}`);
+    if (!response.ok) throw new Error("constellation failed");
+    state.constellation = await response.json();
+  } catch (error) {
+    console.warn("constellation endpoint unavailable", error);
+    state.constellation = null;
   }
 }
 
@@ -72,7 +177,12 @@ async function loadMission() {
     const response = await fetch(apiUrl());
     if (!response.ok) throw new Error("mission request failed");
     state.mission = await response.json();
+    if (state.mission.paletteId) {
+      state.paletteId = state.mission.paletteId;
+      renderPalettePicker();
+    }
     renderMission();
+    await loadConstellation();
   } catch (error) {
     elements.missionName.textContent = "Signal interrupted";
     elements.missionTagline.textContent = "The C++ server did not return a mission packet.";
@@ -90,7 +200,7 @@ function renderMission() {
   elements.missionTagline.textContent = mission.tagline;
   elements.updatedAt.textContent = `Updated ${new Date(mission.updatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
   elements.modeBadge.textContent = modeTitle(mission.mode);
-  elements.paletteName.textContent = mission.seed;
+  elements.paletteName.textContent = mission.paletteName || mission.seed;
 
   elements.metrics.innerHTML = mission.metrics.map((metric) => `
     <article class="metric-card">
@@ -138,6 +248,46 @@ function drawGrid(width, height, palette) {
   ctx.restore();
 }
 
+function drawConstellationLayer(width, height, palette) {
+  const pack = state.constellation;
+  if (!pack || !pack.stars) return;
+
+  const stars = pack.stars.map((star, index) => {
+    const drift = Math.sin(state.time * 0.9 + index) * 4;
+    return {
+      x: star.x * width + drift,
+      y: star.y * height + Math.cos(state.time * 0.7 + index) * 3,
+      size: star.size,
+      brightness: star.brightness
+    };
+  });
+
+  ctx.save();
+  if (pack.links) {
+    ctx.lineWidth = 1;
+    pack.links.forEach((link, index) => {
+      const a = stars[link[0]];
+      const b = stars[link[1]];
+      if (!a || !b) return;
+      ctx.strokeStyle = palette[3] || "#d85d4c";
+      ctx.globalAlpha = 0.08 + (index % 3) * 0.03;
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
+    });
+  }
+
+  stars.forEach((star) => {
+    ctx.globalAlpha = 0.25 + star.brightness * 0.55;
+    ctx.fillStyle = palette[1] || "#f7f2e8";
+    ctx.beginPath();
+    ctx.arc(star.x, star.y, star.size * 0.55, 0, Math.PI * 2);
+    ctx.fill();
+  });
+  ctx.restore();
+}
+
 function drawCanvas() {
   const width = elements.canvas.clientWidth;
   const height = elements.canvas.clientHeight;
@@ -151,6 +301,7 @@ function drawCanvas() {
   if (mission) {
     const palette = mission.palette;
     drawGrid(width, height, palette);
+    drawConstellationLayer(width, height, palette);
 
     const nodes = mission.nodes.map((node, index) => {
       const drift = Math.sin(state.time * (1.5 + index * 0.03) + index) * 10;
@@ -237,6 +388,15 @@ function bindEvents() {
     loadMission();
   });
 
+  if (elements.reseedConstellation) {
+    elements.reseedConstellation.addEventListener("click", async () => {
+      state.constellationSeed = Math.floor(Math.random() * 1000000);
+      elements.reseedConstellation.disabled = true;
+      await loadConstellation();
+      elements.reseedConstellation.disabled = false;
+    });
+  }
+
   elements.copy.addEventListener("click", async () => {
     if (!state.mission) return;
     await navigator.clipboard.writeText(JSON.stringify(state.mission, null, 2));
@@ -264,6 +424,12 @@ function bindEvents() {
 resizeCanvas();
 bindEvents();
 checkHealth();
+loadPalettes();
 loadMission();
+loadMetrics();
 drawCanvas();
 
+window.setInterval(() => {
+  checkHealth();
+  loadMetrics();
+}, 4000);
