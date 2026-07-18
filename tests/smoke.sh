@@ -73,4 +73,56 @@ echo "$OPT_OUT" | grep -qi "Access-Control-Allow-Methods"
 GET_HDR=$(curl -sS -D - -o /dev/null "$BASE/api/health")
 echo "$GET_HDR" | grep -qi "X-Content-Type-Options: nosniff"
 
+echo "== keep-alive =="
+REUSED=$(curl -v -s -o /dev/null "$BASE/api/health" -o /dev/null "$BASE/api/palettes" 2>&1 | grep -c 'Re-using existing connection' || true)
+[ "$REUSED" -ge 1 ]
+
+echo "== 413 payload too large =="
+BIG_BODY=/tmp/asterforge-big-body.bin
+head -c 2097152 /dev/zero > "$BIG_BODY"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST --data-binary @"$BIG_BODY" "$BASE/api/echo")
+[ "$CODE" = "413" ]
+rm -f "$BIG_BODY"
+
+echo "== concurrency =="
+CONC_OUT=/tmp/asterforge-conc.out
+: > "$CONC_OUT"
+CURL_PIDS=()
+for _ in {1..50}; do
+  curl -s -o /dev/null -w '%{http_code}\n' "$BASE/api/health" >> "$CONC_OUT" &
+  CURL_PIDS+=("$!")
+done
+wait "${CURL_PIDS[@]}"
+[ "$(grep -c '^200$' "$CONC_OUT")" -eq 50 ]
+
+echo "== graceful shutdown + access log =="
+PORT2=$((PORT + 1))
+LOG2=/tmp/asterforge-smoke2.log
+"$ROOT_DIR/build/cpp_fantastic_website" --port "$PORT2" > "$LOG2" 2>&1 &
+PID2=$!
+trap 'kill "$SERVER_PID" "$PID2" >/dev/null 2>&1 || true' EXIT
+for _ in {1..40}; do
+  if curl -fsS "http://localhost:$PORT2/api/health" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.15
+done
+curl -fsS "http://localhost:$PORT2/api/health" >/dev/null
+kill -TERM "$PID2"
+for _ in {1..30}; do
+  kill -0 "$PID2" 2>/dev/null || break
+  sleep 0.1
+done
+if kill -0 "$PID2" 2>/dev/null; then
+  echo "server did not shut down within 3s"
+  kill -9 "$PID2"
+  exit 1
+fi
+SHUTDOWN_STATUS=0
+wait "$PID2" || SHUTDOWN_STATUS=$?
+[ "$SHUTDOWN_STATUS" -eq 0 ]
+grep -q '"GET /api/health HTTP/1.1" 200' "$LOG2"
+grep -q 'ms' "$LOG2"
+grep -q 'AsterForge shutting down' "$LOG2"
+
 echo "AsterForge smoke test passed on port $PORT"

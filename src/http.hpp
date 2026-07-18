@@ -2,9 +2,12 @@
 
 #include "util.hpp"
 
+#include <cerrno>
 #include <map>
 #include <sstream>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <sys/socket.h>
 #include <unistd.h>
@@ -12,6 +15,10 @@
 namespace aster {
 
 inline constexpr const char* kVersion = "1.1.0";
+
+inline constexpr std::size_t kMaxHeaderBytes = 64 * 1024;
+inline constexpr std::size_t kMaxBodyBytes = 1024 * 1024;
+inline constexpr int kMaxRequestsPerConn = 100;
 
 struct Request {
     std::string method;
@@ -29,6 +36,21 @@ struct Response {
     std::string content_type = "text/plain; charset=utf-8";
     std::string body;
     bool include_body = true;
+    std::vector<std::pair<std::string, std::string>> extra_headers;
+};
+
+// Outcome of reading one request off a connection.
+enum class ReadResult { Ok, Closed, Timeout, Malformed, HeadersTooLarge, BodyTooLarge };
+
+// Outcome of attempting to parse one request from an in-memory buffer.
+enum class ParseState { NeedMore, Complete, Malformed, HeadersTooLarge, BodyTooLarge };
+
+// Classification of a Content-Length header against the configured body limit.
+enum class ContentLengthClass { Ok, TooLarge, Malformed };
+
+struct ContentLengthInfo {
+    ContentLengthClass status = ContentLengthClass::Ok;
+    std::size_t length = 0;
 };
 
 inline bool send_all(int socket_fd, const std::string& payload) {
@@ -36,6 +58,9 @@ inline bool send_all(int socket_fd, const std::string& payload) {
     std::size_t remaining = payload.size();
     while (remaining > 0) {
         const ssize_t sent = ::send(socket_fd, data, remaining, 0);
+        if (sent < 0 && errno == EINTR) {
+            continue;
+        }
         if (sent <= 0) {
             return false;
         }
@@ -45,21 +70,46 @@ inline bool send_all(int socket_fd, const std::string& payload) {
     return true;
 }
 
-inline std::size_t content_length_from_headers(const std::map<std::string, std::string>& headers) {
+// Strict Content-Length parsing: absent means "no body"; anything non-numeric,
+// negative, or with trailing garbage is Malformed; larger than max_bytes is
+// TooLarge (the body must be rejected without reading it).
+inline ContentLengthInfo classify_content_length(const std::map<std::string, std::string>& headers,
+                                                 std::size_t max_bytes) {
     const auto it = headers.find("content-length");
     if (it == headers.end()) {
-        return 0;
+        return {ContentLengthClass::Ok, 0};
     }
-    try {
-        const long value = std::stol(it->second);
-        if (value < 0) {
-            return 0;
+    const std::string& value = it->second;
+    std::string trimmed = value;
+    while (!trimmed.empty() && (trimmed.back() == ' ' || trimmed.back() == '\t')) {
+        trimmed.pop_back();
+    }
+    if (trimmed.empty() || trimmed.size() > 19) {
+        return {ContentLengthClass::Malformed, 0};
+    }
+    unsigned long long parsed = 0;
+    for (const char ch : trimmed) {
+        if (ch < '0' || ch > '9') {
+            return {ContentLengthClass::Malformed, 0};
         }
-        // Cap body size for demos / safety (1 MiB).
-        return static_cast<std::size_t>(std::min<long>(value, 1024 * 1024));
-    } catch (...) {
-        return 0;
+        parsed = parsed * 10 + static_cast<unsigned long long>(ch - '0');
     }
+    if (parsed > max_bytes) {
+        return {ContentLengthClass::TooLarge, static_cast<std::size_t>(parsed)};
+    }
+    return {ContentLengthClass::Ok, static_cast<std::size_t>(parsed)};
+}
+
+// Keep-alive decision per HTTP/1.x semantics (case-insensitive header value).
+inline bool wants_keep_alive(const std::string& version, const std::string& connection_header) {
+    const std::string connection = to_lower(connection_header);
+    if (version == "HTTP/1.1") {
+        return connection != "close";
+    }
+    if (version == "HTTP/1.0") {
+        return connection == "keep-alive";
+    }
+    return false;
 }
 
 // Parse request-line + headers from the raw buffer; body may still be incomplete.
@@ -107,91 +157,136 @@ inline Request parse_request_headers(const std::string& raw) {
     return request;
 }
 
-// Read full HTTP request including body based on Content-Length.
-inline bool read_http_request(int client_fd, Request& request) {
-    std::string raw;
-    char buffer[4096];
+inline bool request_line_valid(const Request& request) {
+    return !request.method.empty() && !request.target.empty() &&
+           request.version.size() == 8 && request.version.compare(0, 7, "HTTP/1.") == 0 &&
+           request.version[7] >= '0' && request.version[7] <= '9';
+}
 
-    while (raw.find("\r\n\r\n") == std::string::npos && raw.size() < 65536) {
-        const ssize_t received = ::recv(client_fd, buffer, sizeof(buffer), 0);
-        if (received <= 0) {
-            return false;
-        }
-        raw.append(buffer, static_cast<std::size_t>(received));
+// Pure parser over an in-memory buffer. On Complete, `request` holds exactly one
+// request and `leftover` receives any pipelined bytes that followed it.
+inline ParseState try_parse_request(const std::string& raw, Request& request, std::string& leftover,
+                                    std::size_t max_body_bytes = kMaxBodyBytes) {
+    const std::size_t header_end = raw.find("\r\n\r\n");
+    if (header_end == std::string::npos) {
+        return raw.size() > kMaxHeaderBytes ? ParseState::HeadersTooLarge : ParseState::NeedMore;
     }
-
-    if (raw.find("\r\n\r\n") == std::string::npos) {
-        return false;
+    if (header_end > kMaxHeaderBytes) {
+        return ParseState::HeadersTooLarge;
     }
 
     request = parse_request_headers(raw);
-    const std::size_t expected = content_length_from_headers(request.headers);
+    if (!request_line_valid(request)) {
+        return ParseState::Malformed;
+    }
 
-    while (request.body.size() < expected && request.body.size() < 1024 * 1024) {
-        const ssize_t received = ::recv(client_fd, buffer, sizeof(buffer), 0);
-        if (received <= 0) {
-            break;
+    const ContentLengthInfo info = classify_content_length(request.headers, max_body_bytes);
+    if (info.status == ContentLengthClass::Malformed) {
+        return ParseState::Malformed;
+    }
+    if (info.status == ContentLengthClass::TooLarge) {
+        return ParseState::BodyTooLarge;
+    }
+
+    if (request.body.size() < info.length) {
+        return ParseState::NeedMore;
+    }
+    if (request.body.size() > info.length) {
+        leftover = request.body.substr(info.length);
+        request.body.resize(info.length);
+    }
+    return ParseState::Complete;
+}
+
+// Read one full HTTP request (headers + Content-Length body) off the socket.
+// `leftover` carries unconsumed bytes between pipelined keep-alive requests:
+// it seeds this read and receives any over-read bytes for the next one.
+inline ReadResult read_http_request(int client_fd, Request& request, std::string& leftover,
+                                    std::size_t max_body_bytes = kMaxBodyBytes) {
+    std::string raw = std::move(leftover);
+    leftover.clear();
+    char buffer[4096];
+
+    while (true) {
+        switch (try_parse_request(raw, request, leftover, max_body_bytes)) {
+            case ParseState::Complete: return ReadResult::Ok;
+            case ParseState::Malformed: return ReadResult::Malformed;
+            case ParseState::HeadersTooLarge: return ReadResult::HeadersTooLarge;
+            case ParseState::BodyTooLarge: return ReadResult::BodyTooLarge;
+            case ParseState::NeedMore: break;
         }
-        request.body.append(buffer, static_cast<std::size_t>(received));
+        const ssize_t received = ::recv(client_fd, buffer, sizeof(buffer), 0);
+        if (received == 0) {
+            return ReadResult::Closed;
+        }
+        if (received < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return ReadResult::Timeout;
+            }
+            return ReadResult::Closed;
+        }
+        raw.append(buffer, static_cast<std::size_t>(received));
     }
-
-    if (request.body.size() > expected) {
-        request.body.resize(expected);
-    }
-    return true;
 }
 
 inline Response json_response(const std::string& body, int status = 200, const std::string& status_text = "OK") {
-    return Response{status, status_text, "application/json; charset=utf-8", body, true};
+    return Response{status, status_text, "application/json; charset=utf-8", body, true, {}};
 }
 
 inline Response not_found() {
-    return Response{404, "Not Found", "text/plain; charset=utf-8", "404 Not Found\n", true};
+    return Response{404, "Not Found", "text/plain; charset=utf-8", "404 Not Found\n", true, {}};
 }
 
 inline Response bad_request(const std::string& message) {
-    return Response{400, "Bad Request", "text/plain; charset=utf-8", message + "\n", true};
-}
-
-inline Response method_not_allowed(const std::string& allow) {
-    Response response{405, "Method Not Allowed", "text/plain; charset=utf-8", "405 Method Not Allowed\n", true};
-    // Allow header is injected in send_response via content_type abuse? Better add optional headers.
-    // We'll put Allow in the body note for simplicity and set via specialized send if needed.
-    (void)allow;
-    return response;
+    return Response{400, "Bad Request", "text/plain; charset=utf-8", message + "\n", true, {}};
 }
 
 inline std::string status_text_for(int status) {
     switch (status) {
         case 200: return "OK";
         case 204: return "No Content";
+        case 304: return "Not Modified";
         case 400: return "Bad Request";
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
+        case 408: return "Request Timeout";
         case 413: return "Payload Too Large";
+        case 429: return "Too Many Requests";
+        case 431: return "Request Header Fields Too Large";
         case 500: return "Internal Server Error";
+        case 503: return "Service Unavailable";
         default: return "OK";
     }
 }
 
-inline bool send_response(int client_fd, Response response, const std::string& allow_methods = "") {
-    if (!response.include_body) {
-        // HEAD: keep Content-Length of the would-be body but omit payload.
-    }
+inline Response method_not_allowed() {
+    Response response{405, status_text_for(405), "text/plain; charset=utf-8",
+                      "405 Method Not Allowed\n", true, {}};
+    response.extra_headers.emplace_back("Allow", "GET, HEAD, POST, OPTIONS");
+    return response;
+}
 
+inline Response simple_status(int status) {
+    return Response{status, status_text_for(status), "text/plain; charset=utf-8",
+                    std::to_string(status) + " " + status_text_for(status) + "\n", true, {}};
+}
+
+inline bool send_response(int client_fd, Response response, bool keep_alive) {
     const std::size_t body_size = response.body.size();
     std::ostringstream payload;
     payload << "HTTP/1.1 " << response.status << " " << response.status_text << "\r\n";
     payload << "Content-Type: " << response.content_type << "\r\n";
     payload << "Content-Length: " << body_size << "\r\n";
-    payload << "Cache-Control: no-store\r\n";
-    payload << "Connection: close\r\n";
+    payload << "Connection: " << (keep_alive ? "keep-alive" : "close") << "\r\n";
     payload << "X-Content-Type-Options: nosniff\r\n";
     payload << "Access-Control-Allow-Origin: *\r\n";
     payload << "Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS\r\n";
     payload << "Access-Control-Allow-Headers: Content-Type\r\n";
-    if (!allow_methods.empty()) {
-        payload << "Allow: " << allow_methods << "\r\n";
+    for (const auto& header : response.extra_headers) {
+        payload << header.first << ": " << header.second << "\r\n";
     }
     payload << "\r\n";
     if (response.include_body) {
