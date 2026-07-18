@@ -19,11 +19,12 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(cpp_fantastic_website PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-# Lightweight unit tests for pure helpers (url_decode / json_escape).
+# Lightweight unit tests for pure helpers (parsing, limits, caching, rate limiting).
 add_executable(aster_unit_tests
     tests/unit_tests.cpp
 )
 target_include_directories(aster_unit_tests PRIVATE src)
+target_link_libraries(aster_unit_tests PRIVATE Threads::Threads)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(aster_unit_tests PRIVATE -Wall -Wextra -Wpedantic)
 endif()

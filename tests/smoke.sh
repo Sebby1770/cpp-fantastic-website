@@ -95,12 +95,62 @@ done
 wait "${CURL_PIDS[@]}"
 [ "$(grep -c '^200$' "$CONC_OUT")" -eq 50 ]
 
+echo "== static caching (ETag / Last-Modified / 304) =="
+CSS_HDRS=$(curl -sD - -o /dev/null "$BASE/styles.css")
+echo "$CSS_HDRS" | grep -qi '^ETag:'
+echo "$CSS_HDRS" | grep -qi '^Last-Modified:'
+echo "$CSS_HDRS" | grep -qi 'Cache-Control: public, max-age=300'
+ETAG=$(echo "$CSS_HDRS" | grep -i '^ETag:' | awk '{print $2}' | tr -d '\r')
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "If-None-Match: $ETAG" "$BASE/styles.css")
+[ "$CODE" = "304" ]
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "If-None-Match: \"mismatch\"" "$BASE/styles.css")
+[ "$CODE" = "200" ]
+LASTMOD=$(echo "$CSS_HDRS" | grep -i '^Last-Modified:' | sed 's/^[^:]*: //' | tr -d '\r')
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "If-Modified-Since: $LASTMOD" "$BASE/styles.css")
+[ "$CODE" = "304" ]
+curl -sD - -o /dev/null "$BASE/api/health" | grep -qi 'Cache-Control: no-store'
+
+echo "== path traversal defense =="
+CODE=$(curl -s -o /dev/null -w '%{http_code}' --path-as-is "$BASE/../src/main.cpp")
+[ "$CODE" = "400" ] || [ "$CODE" = "404" ]
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/%2e%2e/%2e%2e/etc/passwd")
+[ "$CODE" = "400" ] || [ "$CODE" = "404" ]
+
+echo "== metrics (status classes + latency, shapes preserved) =="
+METRICS_JSON=$(curl -fsS "$BASE/api/metrics")
+echo "$METRICS_JSON" | grep -q '"status"'
+echo "$METRICS_JSON" | grep -q '"2xx"'
+echo "$METRICS_JSON" | grep -q '"latency_ms"'
+echo "$METRICS_JSON" | grep -q '"p99"'
+echo "$METRICS_JSON" | grep -q '"total_requests"'
+echo "$METRICS_JSON" | grep -q '"by_path"'
+
+echo "== rate limiting =="
+PORT3=$((PORT + 2))
+"$ROOT_DIR/build/cpp_fantastic_website" --port "$PORT3" --rate-limit 3 --quiet >/tmp/asterforge-smoke3.log 2>&1 &
+PID3=$!
+trap 'kill "$SERVER_PID" "$PID3" >/dev/null 2>&1 || true' EXIT
+for _ in {1..40}; do
+  if curl -fsS "http://localhost:$PORT3/api/health" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.15
+done
+RL_OUT=/tmp/asterforge-rl.out
+: > "$RL_OUT"
+for _ in {1..20}; do
+  curl -sD - -o /dev/null "http://localhost:$PORT3/api/health" >> "$RL_OUT"
+done
+grep -q " 429" "$RL_OUT"
+grep -qi "Retry-After: 1" "$RL_OUT"
+kill "$PID3" >/dev/null 2>&1 || true
+
 echo "== graceful shutdown + access log =="
 PORT2=$((PORT + 1))
 LOG2=/tmp/asterforge-smoke2.log
 "$ROOT_DIR/build/cpp_fantastic_website" --port "$PORT2" > "$LOG2" 2>&1 &
 PID2=$!
-trap 'kill "$SERVER_PID" "$PID2" >/dev/null 2>&1 || true' EXIT
+trap 'kill "$SERVER_PID" "$PID2" "$PID3" >/dev/null 2>&1 || true' EXIT
 for _ in {1..40}; do
   if curl -fsS "http://localhost:$PORT2/api/health" >/dev/null 2>&1; then
     break

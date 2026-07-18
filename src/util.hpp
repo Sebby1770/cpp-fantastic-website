@@ -125,6 +125,47 @@ inline std::string current_time_iso() {
     return out.str();
 }
 
+inline std::time_t file_time_to_time_t(std::filesystem::file_time_type file_time) {
+    // C++17 has no clock_cast; bridge through the current time of both clocks.
+    const auto system_time = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+        file_time - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now());
+    return std::chrono::system_clock::to_time_t(system_time);
+}
+
+// IMF-fixdate per RFC 9110, e.g. "Thu, 17 Jul 2026 05:00:00 GMT".
+inline std::string http_date(std::time_t time) {
+    std::tm utc{};
+    gmtime_r(&time, &utc);
+    std::ostringstream out;
+    out << std::put_time(&utc, "%a, %d %b %Y %H:%M:%S GMT");
+    return out.str();
+}
+
+inline std::string http_date(std::filesystem::file_time_type file_time) {
+    return http_date(file_time_to_time_t(file_time));
+}
+
+inline bool parse_http_date(const std::string& value, std::time_t& out) {
+    std::tm parsed{};
+    if (strptime(value.c_str(), "%a, %d %b %Y %H:%M:%S GMT", &parsed) == nullptr) {
+        return false;
+    }
+    out = timegm(&parsed);
+    return true;
+}
+
+// FNV-1a 64-bit over arbitrary bytes, rendered as 16 hex chars (for weak ETags).
+inline std::string weak_hash_hex(const std::string& data) {
+    std::uint64_t hash = 14695981039346656037ull;
+    for (const unsigned char ch : data) {
+        hash ^= ch;
+        hash *= 1099511628211ull;
+    }
+    std::ostringstream out;
+    out << std::hex << std::setw(16) << std::setfill('0') << hash;
+    return out.str();
+}
+
 inline std::string mime_type(const std::filesystem::path& path) {
     const std::string ext = to_lower(path.extension().string());
     if (ext == ".html") return "text/html; charset=utf-8";

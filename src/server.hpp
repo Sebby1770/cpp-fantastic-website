@@ -4,6 +4,7 @@
 #include "log.hpp"
 #include "metrics.hpp"
 #include "mission.hpp"
+#include "rate_limiter.hpp"
 #include "thread_pool.hpp"
 #include "util.hpp"
 
@@ -12,6 +13,7 @@
 #include <chrono>
 #include <filesystem>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -35,7 +37,51 @@ struct CliOptions {
     bool quiet = false;
     unsigned threads = default_thread_count();
     std::size_t max_body = kMaxBodyBytes;
+    double rate_limit = 50.0;  // sustained requests/sec per IP; 0 disables
 };
+
+// Resolve a request path to a file inside public_dir, or nullopt when the
+// path escapes the public root (traversal, symlink escape) or is otherwise
+// unusable. Pure-ish (touches the filesystem read-only) so it is unit-testable.
+inline std::optional<fs::path> resolve_static_path(const fs::path& public_dir,
+                                                   const std::string& request_path) {
+    if (request_path.find("..") != std::string::npos ||
+        request_path.find('\0') != std::string::npos) {
+        return std::nullopt;
+    }
+
+    std::string relative = request_path == "/" ? "/index.html" : request_path;
+    while (!relative.empty() && relative.front() == '/') {
+        relative.erase(relative.begin());
+    }
+    if (relative.empty()) {
+        relative = "index.html";
+    }
+
+    std::error_code ec;
+    fs::path candidate = fs::weakly_canonical(public_dir / relative, ec);
+    if (ec) {
+        return std::nullopt;
+    }
+    if (fs::is_directory(candidate)) {
+        candidate = fs::weakly_canonical(candidate / "index.html", ec);
+        if (ec) {
+            return std::nullopt;
+        }
+    }
+
+    const fs::path root = fs::weakly_canonical(public_dir, ec);
+    if (ec) {
+        return std::nullopt;
+    }
+    const std::string root_str = root.generic_string();
+    const std::string candidate_str = candidate.generic_string();
+    if (candidate_str != root_str &&
+        candidate_str.compare(0, root_str.size() + 1, root_str + "/") != 0) {
+        return std::nullopt;
+    }
+    return candidate;
+}
 
 class Server {
 public:
@@ -44,6 +90,8 @@ public:
           public_dir_(std::move(public_dir)),
           quiet_(options.quiet),
           max_body_(options.max_body),
+          rate_limit_(options.rate_limit),
+          limiter_(options.rate_limit * 2.0, options.rate_limit),
           pool_(options.threads) {}
 
     int run(std::atomic<bool>& running) {
@@ -138,11 +186,18 @@ private:
             Response response;
             bool keep_alive = false;
             if (result == ReadResult::Ok) {
-                response = route(request);
-                const auto connection = request.headers.find("connection");
-                keep_alive = wants_keep_alive(
-                    request.version,
-                    connection == request.headers.end() ? "" : connection->second);
+                if (rate_limit_ > 0.0 && !limiter_.allow(client_ip, started)) {
+                    response = json_response("{\"error\":\"rate_limited\"}", 429,
+                                             status_text_for(429));
+                    response.extra_headers.emplace_back("Retry-After", "1");
+                    response.extra_headers.emplace_back("Cache-Control", "no-store");
+                } else {
+                    response = route(request);
+                    const auto connection = request.headers.find("connection");
+                    keep_alive = wants_keep_alive(
+                        request.version,
+                        connection == request.headers.end() ? "" : connection->second);
+                }
             } else if (result == ReadResult::Malformed) {
                 response = bad_request("400 Bad Request: malformed HTTP request.");
             } else if (result == ReadResult::HeadersTooLarge) {
@@ -161,7 +216,7 @@ private:
             const auto latency = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - started);
 
-            metrics_.record(request.path.empty() ? "/" : request.path);
+            metrics_.record(request.path.empty() ? "/" : request.path, response.status, latency);
 
             if (!quiet_) {
                 access_log(client_ip, request, response.status, response.body.size(), latency);
@@ -268,36 +323,66 @@ private:
             return method_not_allowed();
         }
 
-        return serve_static(request.path);
+        return serve_static(request);
     }
 
-    Response serve_static(const std::string& request_path) const {
+    Response serve_static(const Request& request) const {
+        const std::string& request_path = request.path;
+        if (request_path.find('\0') != std::string::npos) {
+            return bad_request("Invalid path.");
+        }
         if (request_path.find("..") != std::string::npos) {
             return bad_request("Path traversal is not allowed.");
         }
 
-        std::string relative = request_path == "/" ? "/index.html" : request_path;
-        while (!relative.empty() && relative.front() == '/') {
-            relative.erase(relative.begin());
+        const std::optional<fs::path> resolved = resolve_static_path(public_dir_, request_path);
+        if (!resolved) {
+            return not_found();
         }
-
-        fs::path file_path = public_dir_ / relative;
-        if (fs::is_directory(file_path)) {
-            file_path /= "index.html";
-        }
-
+        const fs::path& file_path = *resolved;
         if (!fs::exists(file_path) || !fs::is_regular_file(file_path)) {
             return not_found();
         }
 
         const std::string body = read_file(file_path);
-        return Response{200, "OK", mime_type(file_path), body, true, {}};
+        const std::string etag =
+            "\"" + weak_hash_hex(body) + "-" + std::to_string(body.size()) + "\"";
+        std::error_code ec;
+        const auto mtime = fs::last_write_time(file_path, ec);
+        const std::string last_modified = ec ? std::string{} : http_date(mtime);
+
+        // Conditional requests: If-None-Match wins over If-Modified-Since (RFC 9110).
+        bool not_modified = false;
+        const auto if_none_match = request.headers.find("if-none-match");
+        if (if_none_match != request.headers.end()) {
+            not_modified = if_none_match->second == etag || if_none_match->second == "*";
+        } else {
+            const auto if_modified_since = request.headers.find("if-modified-since");
+            std::time_t since = 0;
+            if (if_modified_since != request.headers.end() && !ec &&
+                parse_http_date(if_modified_since->second, since)) {
+                not_modified = file_time_to_time_t(mtime) <= since;
+            }
+        }
+
+        Response response =
+            not_modified
+                ? Response{304, status_text_for(304), mime_type(file_path), "", true, {}}
+                : Response{200, "OK", mime_type(file_path), body, true, {}};
+        response.extra_headers.emplace_back("ETag", etag);
+        response.extra_headers.emplace_back("Cache-Control", "public, max-age=300");
+        if (!last_modified.empty()) {
+            response.extra_headers.emplace_back("Last-Modified", last_modified);
+        }
+        return response;
     }
 
     int port_;
     fs::path public_dir_;
     bool quiet_;
     std::size_t max_body_;
+    double rate_limit_;
+    RateLimiter limiter_;
     ThreadPool pool_;
     Metrics metrics_;
     std::atomic<bool>* running_ = nullptr;
@@ -327,11 +412,14 @@ inline CliOptions parse_cli(int argc, char** argv) {
             options.threads = static_cast<unsigned>(std::clamp(std::stoi(argv[++i]), 2, 32));
         } else if (arg == "--max-body" && i + 1 < argc) {
             options.max_body = static_cast<std::size_t>(std::max(1L, std::stol(argv[++i])));
+        } else if (arg == "--rate-limit" && i + 1 < argc) {
+            options.rate_limit = std::max(0.0, std::stod(argv[++i]));
         } else if (arg == "--quiet" || arg == "-q") {
             options.quiet = true;
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "AsterForge " << kVersion << "\n"
-                      << "Usage: cpp_fantastic_website [--port N] [--threads N] [--max-body BYTES] [--quiet]\n";
+                      << "Usage: cpp_fantastic_website [--port N] [--threads N] [--max-body BYTES]"
+                      << " [--rate-limit N] [--quiet]\n";
             std::exit(0);
         }
     }
