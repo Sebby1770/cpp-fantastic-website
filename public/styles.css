@@ -173,6 +173,18 @@ h2 {
   background: rgba(36, 124, 118, 0.12);
 }
 
+.status-pill.live {
+  color: #175b45;
+  border-color: rgba(36, 124, 118, 0.5);
+  background: rgba(36, 124, 118, 0.18);
+}
+
+.status-pill.reconnecting {
+  color: #8a5a17;
+  border-color: rgba(199, 154, 52, 0.44);
+  background: rgba(199, 154, 52, 0.14);
+}
+
 .segmented {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -371,6 +383,60 @@ input[type="range"] {
   font-size: 0.86rem;
 }
 
+#telemetryPanel #sparkCanvas {
+  display: block;
+  width: 100%;
+  height: 64px;
+  margin-bottom: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.telemetry-readouts,
+.status-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.telemetry-readouts {
+  margin-bottom: 10px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--paper);
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.chip strong {
+  color: var(--ink);
+  font-weight: 900;
+}
+
+.chip.status-2xx strong {
+  color: var(--teal);
+}
+
+.chip.status-4xx strong {
+  color: var(--gold);
+}
+
+.chip.status-5xx strong {
+  color: var(--red);
+}
+
 .metrics-summary {
   display: flex;
   flex-wrap: wrap;
@@ -452,6 +518,13 @@ input[type="range"] {
   border-color: rgba(251, 250, 246, 0.22);
   background: rgba(251, 250, 246, 0.09);
   font-weight: 800;
+}
+
+#warpButton.active {
+  color: var(--stage);
+  border-color: var(--gold);
+  background: var(--gold);
+  box-shadow: 0 0 0 3px rgba(199, 154, 52, 0.25);
 }
 
 .metric-strip {
@@ -537,6 +610,81 @@ input[type="range"] {
   background: var(--teal);
 }
 
+#shortcutOverlay {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(23, 23, 23, 0.55);
+  backdrop-filter: blur(8px);
+}
+
+#shortcutOverlay[hidden] {
+  display: none;
+}
+
+.shortcut-card {
+  width: min(440px, 100%);
+  padding: 22px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--paper);
+  box-shadow: var(--shadow);
+}
+
+.shortcut-card h2 {
+  margin-bottom: 14px;
+}
+
+.shortcut-list {
+  display: grid;
+  gap: 10px;
+  margin: 0 0 14px;
+}
+
+.shortcut-list div {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.shortcut-list dt {
+  min-width: 92px;
+}
+
+.shortcut-list dd {
+  margin: 0;
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.shortcut-list kbd {
+  display: inline-grid;
+  place-items: center;
+  min-width: 26px;
+  min-height: 26px;
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-bottom-width: 2px;
+  border-radius: 6px;
+  background: var(--panel);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition: none !important;
+    animation: none !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 @media (max-width: 1100px) {
   .app-shell {
     grid-template-columns: 260px minmax(0, 1fr);
@@ -579,7 +727,8 @@ input[type="range"] {
   }
 
   .stage {
-    min-height: 78vh;
+    min-height: 320px;
+    height: 62vh;
   }
 
   .stage-topbar,
@@ -599,5 +748,16 @@ input[type="range"] {
 
   .intel-panel {
     display: flex;
+  }
+
+  .mode-button,
+  .glass-button,
+  .palette-option {
+    min-height: 44px;
+  }
+
+  .icon-button {
+    width: 44px;
+    height: 44px;
   }
 }

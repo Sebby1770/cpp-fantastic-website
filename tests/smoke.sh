@@ -125,6 +125,26 @@ echo "$METRICS_JSON" | grep -q '"p99"'
 echo "$METRICS_JSON" | grep -q '"total_requests"'
 echo "$METRICS_JSON" | grep -q '"by_path"'
 
+echo "== SSE telemetry stream =="
+STREAM_OUT=$(curl -sN --max-time 3 "$BASE/api/stream" || true)
+echo "$STREAM_OUT" | grep -q 'event: telemetry'
+echo "$STREAM_OUT" | grep -q '"total_requests"'
+echo "$STREAM_OUT" | grep -q '"tick"'
+echo "$STREAM_OUT" | grep -q '"latency_ms"'
+curl -sN --max-time 2 -D /tmp/sse-headers.txt "$BASE/api/stream" >/dev/null || true
+grep -qi 'Content-Type: text/event-stream' /tmp/sse-headers.txt
+grep -qi 'Cache-Control: no-store' /tmp/sse-headers.txt
+grep -qi 'X-Accel-Buffering: no' /tmp/sse-headers.txt
+
+echo "== frontend wiring =="
+grep -q 'EventSource' "$ROOT_DIR/public/app.js"
+grep -q 'telemetryPanel' "$ROOT_DIR/public/index.html"
+grep -q 'sparkCanvas' "$ROOT_DIR/public/index.html"
+grep -q 'shortcutOverlay' "$ROOT_DIR/public/index.html"
+grep -q 'warpButton' "$ROOT_DIR/public/index.html"
+grep -q 'prefers-reduced-motion' "$ROOT_DIR/public/styles.css"
+grep -q 'prefers-reduced-motion' "$ROOT_DIR/public/app.js"
+
 echo "== rate limiting =="
 PORT3=$((PORT + 2))
 "$ROOT_DIR/build/cpp_fantastic_website" --port "$PORT3" --rate-limit 3 --quiet >/tmp/asterforge-smoke3.log 2>&1 &
@@ -174,5 +194,35 @@ wait "$PID2" || SHUTDOWN_STATUS=$?
 grep -q '"GET /api/health HTTP/1.1" 200' "$LOG2"
 grep -q 'ms' "$LOG2"
 grep -q 'AsterForge shutting down' "$LOG2"
+
+echo "== graceful shutdown with open SSE stream =="
+PORT4=$((PORT + 3))
+LOG4=/tmp/asterforge-smoke4.log
+"$ROOT_DIR/build/cpp_fantastic_website" --port "$PORT4" --quiet > "$LOG4" 2>&1 &
+PID4=$!
+trap 'kill "$SERVER_PID" "$PID2" "$PID3" "$PID4" >/dev/null 2>&1 || true' EXIT
+for _ in {1..40}; do
+  if curl -fsS "http://localhost:$PORT4/api/health" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.15
+done
+curl -sN "http://localhost:$PORT4/api/stream" >/dev/null 2>&1 &
+SSE_PID=$!
+sleep 1
+kill -TERM "$PID4"
+for _ in {1..30}; do
+  kill -0 "$PID4" 2>/dev/null || break
+  sleep 0.1
+done
+if kill -0 "$PID4" 2>/dev/null; then
+  echo "server with open SSE stream did not shut down within 3s"
+  kill -9 "$PID4" "$SSE_PID" >/dev/null 2>&1 || true
+  exit 1
+fi
+SHUTDOWN_STATUS=0
+wait "$PID4" || SHUTDOWN_STATUS=$?
+[ "$SHUTDOWN_STATUS" -eq 0 ]
+kill "$SSE_PID" >/dev/null 2>&1 || true
 
 echo "AsterForge smoke test passed on port $PORT"

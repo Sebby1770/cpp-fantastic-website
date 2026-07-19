@@ -5,6 +5,7 @@
 #include "metrics.hpp"
 #include "mission.hpp"
 #include "rate_limiter.hpp"
+#include "stream.hpp"
 #include "thread_pool.hpp"
 #include "util.hpp"
 
@@ -167,6 +168,12 @@ public:
 
         ::close(server_fd);
         pool_.shutdown();
+        // SSE threads are detached; they notice `running` within 250 ms and
+        // release the hub after their last touch of shared state. Wait briefly
+        // so shutdown stays clean without being hostage to a blocked send.
+        for (int i = 0; i < 60 && stream_hub_.active() > 0; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
         std::cout << "AsterForge shutting down...\n";
         return 0;
     }
@@ -191,6 +198,11 @@ private:
                                              status_text_for(429));
                     response.extra_headers.emplace_back("Retry-After", "1");
                     response.extra_headers.emplace_back("Cache-Control", "no-store");
+                } else if (request.method == "GET" && request.path == "/api/stream") {
+                    // Long-lived SSE stream: hand the fd to a detached thread so
+                    // it never occupies a pool worker; keep-alive is bypassed.
+                    handle_stream(client_fd, client_ip, request, started);
+                    return;
                 } else {
                     response = route(request);
                     const auto connection = request.headers.find("connection");
@@ -227,6 +239,35 @@ private:
             }
         }
         ::close(client_fd);
+    }
+
+    // Answer GET /api/stream: count the request once at connect, then either
+    // reject with 503 (over the concurrent-stream cap) or detach a thread that
+    // owns the fd for the rest of the connection.
+    void handle_stream(int client_fd, const std::string& client_ip, const Request& request,
+                       std::chrono::steady_clock::time_point started) {
+        const bool acquired = stream_hub_.try_acquire();
+        const int status = acquired ? 200 : 503;
+        const auto latency = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - started);
+        metrics_.record(request.path, status, latency);
+        if (!quiet_) {
+            access_log(client_ip, request, status, 0, latency);
+        }
+        if (!acquired) {
+            Response response = json_response("{\"error\":\"too_many_streams\"}", 503,
+                                              status_text_for(503));
+            response.extra_headers.emplace_back("Cache-Control", "no-store");
+            send_response(client_fd, response, false);
+            ::close(client_fd);
+            return;
+        }
+        Metrics& metrics = metrics_;
+        std::atomic<bool>& running = *running_;
+        StreamHub& hub = stream_hub_;
+        std::thread([client_fd, &metrics, &running, &hub] {
+            run_sse(client_fd, metrics, running, hub);
+        }).detach();
     }
 
     Response route(const Request& request) {
@@ -385,6 +426,7 @@ private:
     RateLimiter limiter_;
     ThreadPool pool_;
     Metrics metrics_;
+    StreamHub stream_hub_;
     std::atomic<bool>* running_ = nullptr;
 };
 

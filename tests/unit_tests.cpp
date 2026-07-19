@@ -1,14 +1,21 @@
 #include "http.hpp"
+#include "metrics.hpp"
 #include "rate_limiter.hpp"
 #include "server.hpp"
+#include "stream.hpp"
 #include "util.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <thread>
+
+#include <sys/socket.h>
+#include <unistd.h>
 
 namespace {
 
@@ -219,6 +226,86 @@ int main() {
                         !aster::resolve_static_path(root, "/escape/passwd").has_value());
         }
         fs::remove_all(root);
+    }
+
+    // StreamHub: caps concurrent SSE clients at kMaxStreamClients.
+    {
+        aster::StreamHub hub;
+        bool all_acquired = true;
+        for (int i = 0; i < aster::kMaxStreamClients; ++i) {
+            all_acquired = all_acquired && hub.try_acquire();
+        }
+        expect_true("hub cap acquires", all_acquired);
+        expect_true("hub over cap denied", !hub.try_acquire());
+        hub.release();
+        expect_true("hub release reopens slot", hub.try_acquire());
+        for (int i = 0; i < aster::kMaxStreamClients; ++i) {
+            hub.release();
+        }
+        expect_true("hub drained", hub.active() == 0);
+    }
+
+    // Metrics telemetry snapshot: SSE frame shape and top-6 by_path trimming.
+    {
+        aster::Metrics metrics;
+        for (int i = 0; i < 8; ++i) {
+            metrics.record("/p" + std::to_string(i), 200, std::chrono::microseconds(500));
+        }
+        for (int i = 0; i < 5; ++i) {
+            metrics.record("/hot", 200, std::chrono::microseconds(250));
+        }
+        const std::string frame = metrics.snapshot_json(7);
+        expect_true("snapshot has tick", frame.find("\"tick\":7") != std::string::npos);
+        expect_true("snapshot has totals",
+                    frame.find("\"total_requests\":13") != std::string::npos);
+        expect_true("snapshot has status", frame.find("\"2xx\":13") != std::string::npos);
+        expect_true("snapshot has latency", frame.find("\"p99\"") != std::string::npos);
+        expect_true("snapshot keeps hottest path", frame.find("\"/hot\":5") != std::string::npos);
+        std::size_t path_entries = 0;
+        for (std::size_t at = frame.find("\"/"); at != std::string::npos;
+             at = frame.find("\"/", at + 1)) {
+            ++path_entries;
+        }
+        expect_true("snapshot trims to top 6 paths", path_entries == 6);
+        expect_true("full metrics keep every path",
+                    metrics.to_json().find("\"/p7\"") != std::string::npos);
+    }
+
+    // run_sse over a socketpair: handshake + telemetry events, stops on shutdown.
+    {
+        int fds[2] = {-1, -1};
+        expect_true("sse socketpair", ::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+        aster::Metrics metrics;
+        metrics.record("/api/health", 200, std::chrono::microseconds(400));
+        std::atomic<bool> running{true};
+        aster::StreamHub hub;
+        expect_true("sse hub acquire", hub.try_acquire());
+        std::thread producer([&] { aster::run_sse(fds[1], metrics, running, hub); });
+
+        std::string received;
+        char buffer[4096];
+        while (received.find("\n\n") == std::string::npos) {
+            const ssize_t got = ::recv(fds[0], buffer, sizeof(buffer), 0);
+            if (got <= 0) {
+                break;
+            }
+            received.append(buffer, static_cast<std::size_t>(got));
+        }
+        running = false;
+        producer.join();
+        ::close(fds[0]);
+        expect_true("sse handshake status",
+                    received.find("HTTP/1.1 200 OK") != std::string::npos);
+        expect_true("sse handshake content type",
+                    received.find("Content-Type: text/event-stream") != std::string::npos);
+        expect_true("sse handshake no buffering",
+                    received.find("X-Accel-Buffering: no") != std::string::npos);
+        expect_true("sse event name", received.find("event: telemetry") != std::string::npos);
+        expect_true("sse event payload",
+                    received.find("data: {\"tick\":1,") != std::string::npos);
+        expect_true("sse payload totals",
+                    received.find("\"total_requests\":1") != std::string::npos);
+        expect_true("sse released hub", hub.active() == 0);
     }
 
     if (failures != 0) {

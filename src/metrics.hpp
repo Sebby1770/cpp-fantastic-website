@@ -40,42 +40,97 @@ public:
     }
 
     std::string to_json() const {
+        Snapshot snapshot = collect(0);
         std::ostringstream json;
         json << "{";
-        json << "\"total_requests\":" << total_requests() << ",";
-        json << "\"uptime_seconds\":" << uptime_seconds() << ",";
-        json << "\"by_path\":{";
-        std::array<std::uint64_t, 4> status_classes{};
-        std::vector<std::int64_t> latency_sample;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            bool first = true;
-            for (const auto& entry : by_path_) {
-                if (!first) {
-                    json << ",";
-                }
-                first = false;
-                json << "\"" << json_escape(entry.first) << "\":" << entry.second;
-            }
-            status_classes = status_classes_;
-            const std::size_t sample_size = std::min(latency_count_, kLatencyWindow);
-            latency_sample.assign(latencies_us_.begin(),
-                                  latencies_us_.begin() + static_cast<std::ptrdiff_t>(sample_size));
-        }
-        json << "},";
-        json << "\"status\":{";
-        json << "\"2xx\":" << status_classes[0] << ",";
-        json << "\"3xx\":" << status_classes[1] << ",";
-        json << "\"4xx\":" << status_classes[2] << ",";
-        json << "\"5xx\":" << status_classes[3];
-        json << "},";
-        json << "\"latency_ms\":" << latency_json(latency_sample);
+        json << "\"total_requests\":" << snapshot.total_requests << ",";
+        json << "\"uptime_seconds\":" << snapshot.uptime_seconds << ",";
+        json << "\"by_path\":" << by_path_json(snapshot.by_path) << ",";
+        json << "\"status\":" << status_json(snapshot.status_classes) << ",";
+        json << "\"latency_ms\":" << latency_json(std::move(snapshot.latency_sample));
+        json << "}";
+        return json.str();
+    }
+
+    // Compact per-tick telemetry frame for the /api/stream SSE feed. Shares the
+    // locked snapshot with to_json but trims by_path to the top 6 paths.
+    std::string snapshot_json(std::uint64_t tick) const {
+        Snapshot snapshot = collect(6);
+        std::ostringstream json;
+        json << "{";
+        json << "\"tick\":" << tick << ",";
+        json << "\"uptime_seconds\":" << snapshot.uptime_seconds << ",";
+        json << "\"total_requests\":" << snapshot.total_requests << ",";
+        json << "\"status\":" << status_json(snapshot.status_classes) << ",";
+        json << "\"latency_ms\":" << latency_json(std::move(snapshot.latency_sample)) << ",";
+        json << "\"by_path\":" << by_path_json(snapshot.by_path);
         json << "}";
         return json.str();
     }
 
 private:
     static constexpr std::size_t kLatencyWindow = 1024;
+
+    struct Snapshot {
+        std::uint64_t total_requests = 0;
+        std::int64_t uptime_seconds = 0;
+        std::vector<std::pair<std::string, std::uint64_t>> by_path;
+        std::array<std::uint64_t, 4> status_classes{};
+        std::vector<std::int64_t> latency_sample;
+    };
+
+    // Copy everything out under the lock. top_n == 0 keeps every path (sorted
+    // by name, matching the historical map iteration order); otherwise keep the
+    // top_n busiest paths.
+    Snapshot collect(std::size_t top_n) const {
+        Snapshot snapshot;
+        snapshot.total_requests = total_requests();
+        snapshot.uptime_seconds = uptime_seconds();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            snapshot.by_path.assign(by_path_.begin(), by_path_.end());
+            snapshot.status_classes = status_classes_;
+            const std::size_t sample_size = std::min(latency_count_, kLatencyWindow);
+            snapshot.latency_sample.assign(
+                latencies_us_.begin(),
+                latencies_us_.begin() + static_cast<std::ptrdiff_t>(sample_size));
+        }
+        if (top_n > 0 && snapshot.by_path.size() > top_n) {
+            std::partial_sort(snapshot.by_path.begin(),
+                              snapshot.by_path.begin() + static_cast<std::ptrdiff_t>(top_n),
+                              snapshot.by_path.end(),
+                              [](const auto& a, const auto& b) { return a.second > b.second; });
+            snapshot.by_path.resize(top_n);
+        }
+        return snapshot;
+    }
+
+    static std::string by_path_json(
+        const std::vector<std::pair<std::string, std::uint64_t>>& by_path) {
+        std::ostringstream json;
+        json << "{";
+        bool first = true;
+        for (const auto& entry : by_path) {
+            if (!first) {
+                json << ",";
+            }
+            first = false;
+            json << "\"" << json_escape(entry.first) << "\":" << entry.second;
+        }
+        json << "}";
+        return json.str();
+    }
+
+    static std::string status_json(const std::array<std::uint64_t, 4>& status_classes) {
+        std::ostringstream json;
+        json << "{";
+        json << "\"2xx\":" << status_classes[0] << ",";
+        json << "\"3xx\":" << status_classes[1] << ",";
+        json << "\"4xx\":" << status_classes[2] << ",";
+        json << "\"5xx\":" << status_classes[3];
+        json << "}";
+        return json.str();
+    }
 
     static std::string latency_json(std::vector<std::int64_t> sample) {
         std::ostringstream json;
