@@ -165,6 +165,16 @@ grep -q " 429" "$RL_OUT"
 grep -qi "Retry-After: 1" "$RL_OUT"
 kill "$PID3" >/dev/null 2>&1 || true
 
+echo "== protocol edges (405 Allow, HEAD length, 404, echo JSON) =="
+curl -sD - -o /dev/null -X DELETE "$BASE/api/health" | grep -qi "^Allow:"
+HEAD_LEN=$(curl -sS -I "$BASE/api/health" | tr -d '\r' | awk 'tolower($1)=="content-length:" {print $2}')
+[ -n "$HEAD_LEN" ] && [ "$HEAD_LEN" -gt 0 ]
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/definitely/not/here")
+[ "$CODE" = "404" ]
+printf '{"msg":"quote \\" and\\nnewline"}' \
+  | curl -sS -X POST -H 'Content-Type: application/json' --data-binary @- "$BASE/api/echo" \
+  | python3 -m json.tool >/dev/null
+
 echo "== graceful shutdown + access log =="
 PORT2=$((PORT + 1))
 LOG2=/tmp/asterforge-smoke2.log

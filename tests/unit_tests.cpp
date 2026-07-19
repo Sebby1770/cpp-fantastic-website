@@ -308,6 +308,63 @@ int main() {
         expect_true("sse released hub", hub.active() == 0);
     }
 
+    {
+        const std::string raw =
+            "GET /api/mission?seed=alpha%2Done&mode=calm HTTP/1.1\r\n"
+            "HOST:  aster.local \r\n"
+            "X-Custom:\ttabbed\r\n"
+            "\r\n";
+        const Request request = aster::parse_request_headers(raw);
+        expect_eq("parse_request path", request.path, "/api/mission");
+        expect_eq("parse_request query decoded", request.query.at("seed"), "alpha-one");
+        expect_eq("parse_request query second", request.query.at("mode"), "calm");
+        expect_eq("parse_request header lowercased", request.headers.at("host"), "aster.local ");
+        expect_eq("parse_request header tab trimmed", request.headers.at("x-custom"), "tabbed");
+        expect_true("parse_request no body", request.body.empty());
+    }
+    {
+        const std::string raw =
+            "POST /api/echo HTTP/1.1\r\nContent-Length: 4\r\n\r\nbody";
+        const Request request = aster::parse_request_headers(raw);
+        expect_eq("parse_request body split", request.body, "body");
+    }
+    {
+        const Request request = aster::parse_request_headers("GET ?a=1 HTTP/1.1\r\n\r\n");
+        expect_eq("parse_request empty path becomes root", request.path, "/");
+    }
+
+    {
+        const auto params = aster::parse_query("a=1&&b&c=%2Bx&d=");
+        expect_eq("parse_query plain", params.at("a"), "1");
+        expect_eq("parse_query missing equals", params.at("b"), "");
+        expect_eq("parse_query encoded value", params.at("c"), "+x");
+        expect_eq("parse_query empty value", params.at("d"), "");
+        expect_true("parse_query skips empty pairs", params.size() == 4);
+        const auto encoded_key = aster::parse_query("se%2Ded=1");
+        expect_eq("parse_query encoded key", encoded_key.begin()->first, "se-ed");
+    }
+
+    {
+        const std::map<std::string, std::string> query{{"points", "900"}, {"junk", "abc"}};
+        expect_true("int_param clamps high", aster::int_param(query, "points", 10, 1, 500) == 500);
+        expect_true("int_param non-numeric fallback", aster::int_param(query, "junk", 7, 1, 500) == 7);
+        expect_true("int_param missing fallback", aster::int_param(query, "absent", 42, 1, 500) == 42);
+        expect_eq("string_param truncates", aster::string_param(query, "junk", "dflt", 2), "ab");
+        expect_eq("string_param fallback", aster::string_param(query, "absent", "dflt"), "dflt");
+    }
+
+    expect_eq("mime html", aster::mime_type("index.html"), "text/html; charset=utf-8");
+    expect_eq("mime css", aster::mime_type("styles.css"), "text/css; charset=utf-8");
+    expect_eq("mime js", aster::mime_type("app.js"), "application/javascript; charset=utf-8");
+    expect_eq("mime svg", aster::mime_type("logo.svg"), "image/svg+xml");
+    expect_eq("mime unknown", aster::mime_type("data.bin"), "application/octet-stream");
+
+    expect_true("stable_seed deterministic", aster::stable_seed("orion") == aster::stable_seed("orion"));
+    expect_true("stable_seed distinguishes", aster::stable_seed("orion") != aster::stable_seed("lyra"));
+    expect_true("stable_seed empty fnv basis", aster::stable_seed("") == 2166136261u);
+
+    expect_eq("version constant", std::string(aster::kVersion), "2.0.0");
+
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return 1;
