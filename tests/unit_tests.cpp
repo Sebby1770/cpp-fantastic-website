@@ -271,6 +271,40 @@ int main() {
                     metrics.to_json().find("\"/p7\"") != std::string::npos);
     }
 
+    // Slow-drip defense: a stalled partial request trips the read deadline
+    // (surfaced as Timeout -> 408), while a silent idle connection is a quiet
+    // keep-alive close. Small timeouts keep the test fast.
+    {
+        int fds[2];
+        expect_true("drip socketpair", ::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+        const std::string partial = "GET /api/health HTTP/1.1\r\nHost: x";
+        expect_true("drip partial write",
+                    ::send(fds[0], partial.data(), partial.size(), 0) ==
+                        static_cast<ssize_t>(partial.size()));
+        aster::Request drip_request;
+        std::string drip_leftover;
+        const auto drip_begin = std::chrono::steady_clock::now();
+        const aster::ReadResult drip_result = aster::read_http_request(
+            fds[1], drip_request, drip_leftover, aster::kMaxBodyBytes,
+            std::chrono::milliseconds(80), std::chrono::milliseconds(200));
+        const auto drip_waited = std::chrono::steady_clock::now() - drip_begin;
+        expect_true("drip stalled partial times out", drip_result == aster::ReadResult::Timeout);
+        expect_true("drip timeout is bounded", drip_waited < std::chrono::milliseconds(2000));
+
+        int idle_fds[2];
+        expect_true("idle socketpair", ::socketpair(AF_UNIX, SOCK_STREAM, 0, idle_fds) == 0);
+        aster::Request idle_request;
+        std::string idle_leftover;
+        const aster::ReadResult idle_result = aster::read_http_request(
+            idle_fds[1], idle_request, idle_leftover, aster::kMaxBodyBytes,
+            std::chrono::milliseconds(60), std::chrono::milliseconds(120));
+        expect_true("idle connection closes quietly", idle_result == aster::ReadResult::Closed);
+        ::close(fds[0]);
+        ::close(fds[1]);
+        ::close(idle_fds[0]);
+        ::close(idle_fds[1]);
+    }
+
     // run_sse over a socketpair: handshake + telemetry events, stops on shutdown.
     {
         int fds[2] = {-1, -1};
@@ -300,6 +334,8 @@ int main() {
                     received.find("Content-Type: text/event-stream") != std::string::npos);
         expect_true("sse handshake no buffering",
                     received.find("X-Accel-Buffering: no") != std::string::npos);
+        expect_true("sse handshake nosniff",
+                    received.find("X-Content-Type-Options: nosniff") != std::string::npos);
         expect_true("sse event name", received.find("event: telemetry") != std::string::npos);
         expect_true("sse event payload",
                     received.find("data: {\"tick\":1,") != std::string::npos);

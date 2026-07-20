@@ -57,6 +57,7 @@ inline void run_sse(int client_fd, Metrics& metrics, std::atomic<bool>& running,
         "Cache-Control: no-store\r\n"
         "Connection: keep-alive\r\n"
         "Access-Control-Allow-Origin: *\r\n"
+        "X-Content-Type-Options: nosniff\r\n"
         "X-Accel-Buffering: no\r\n"
         "\r\n";
     if (send_all(client_fd, handshake)) {

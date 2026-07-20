@@ -3,12 +3,14 @@
 #include "util.hpp"
 
 #include <cerrno>
+#include <chrono>
 #include <map>
 #include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -17,6 +19,13 @@ namespace aster {
 inline constexpr std::size_t kMaxHeaderBytes = 64 * 1024;
 inline constexpr std::size_t kMaxBodyBytes = 1024 * 1024;
 inline constexpr int kMaxRequestsPerConn = 100;
+// Longest silence tolerated while waiting for (more of) a request. An idle
+// keep-alive connection is closed quietly; a stalled partial request gets 408.
+inline constexpr std::chrono::milliseconds kIdleTimeoutDefault{5000};
+// Wall-clock budget for reading one complete request. Unlike SO_RCVTIMEO
+// (which a slow-drip client resets with every byte), this bounds the whole
+// read, so a slowloris-style client cannot pin a pool worker indefinitely.
+inline constexpr std::chrono::milliseconds kRequestDeadlineDefault{10000};
 
 struct Request {
     std::string method;
@@ -199,11 +208,23 @@ inline ParseState try_parse_request(const std::string& raw, Request& request, st
 // Read one full HTTP request (headers + Content-Length body) off the socket.
 // `leftover` carries unconsumed bytes between pipelined keep-alive requests:
 // it seeds this read and receives any over-read bytes for the next one.
-inline ReadResult read_http_request(int client_fd, Request& request, std::string& leftover,
-                                    std::size_t max_body_bytes = kMaxBodyBytes) {
+//
+// Two wall-clock limits bound the read (both enforced with poll(), so a
+// client dripping bytes cannot reset them the way it can reset SO_RCVTIMEO):
+//   - idle_timeout: max silence between bytes. Expiring with no request bytes
+//     is a quiet keep-alive close (Closed); mid-request it is a Timeout (408).
+//   - request_deadline: max total time for the whole request, regardless of
+//     how steadily bytes trickle in. Always Timeout when bytes were received.
+inline ReadResult read_http_request(
+    int client_fd, Request& request, std::string& leftover,
+    std::size_t max_body_bytes = kMaxBodyBytes,
+    std::chrono::milliseconds idle_timeout = kIdleTimeoutDefault,
+    std::chrono::milliseconds request_deadline = kRequestDeadlineDefault) {
+    using clock = std::chrono::steady_clock;
     std::string raw = std::move(leftover);
     leftover.clear();
     char buffer[4096];
+    const clock::time_point start = clock::now();
 
     while (true) {
         switch (try_parse_request(raw, request, leftover, max_body_bytes)) {
@@ -213,16 +234,40 @@ inline ReadResult read_http_request(int client_fd, Request& request, std::string
             case ParseState::BodyTooLarge: return ReadResult::BodyTooLarge;
             case ParseState::NeedMore: break;
         }
+
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - start);
+        if (elapsed >= request_deadline) {
+            return raw.empty() ? ReadResult::Closed : ReadResult::Timeout;
+        }
+        std::chrono::milliseconds wait = request_deadline - elapsed;
+        if (idle_timeout < wait) {
+            wait = idle_timeout;
+        }
+
+        pollfd read_poll{};
+        read_poll.fd = client_fd;
+        read_poll.events = POLLIN;
+        const int ready = ::poll(&read_poll, 1, static_cast<int>(wait.count()));
+        if (ready == 0) {
+            // Silence for the whole window: idle keep-alive expiry (quiet
+            // close) or a stalled partial request (408 material).
+            return raw.empty() ? ReadResult::Closed : ReadResult::Timeout;
+        }
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return ReadResult::Closed;
+        }
+
         const ssize_t received = ::recv(client_fd, buffer, sizeof(buffer), 0);
         if (received == 0) {
             return ReadResult::Closed;
         }
         if (received < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return ReadResult::Timeout;
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;  // spurious wakeup; the deadline math above still governs
             }
             return ReadResult::Closed;
         }

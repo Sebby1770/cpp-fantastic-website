@@ -84,6 +84,11 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST --data-binary @"$BIG_BODY"
 [ "$CODE" = "413" ]
 rm -f "$BIG_BODY"
 
+echo "== 431 header cap =="
+BIG_HEADER=$(head -c 70000 /dev/zero | tr '\0' 'a')
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "X-Padding: $BIG_HEADER" "$BASE/api/health")
+[ "$CODE" = "431" ]
+
 echo "== concurrency =="
 CONC_OUT=/tmp/asterforge-conc.out
 : > "$CONC_OUT"

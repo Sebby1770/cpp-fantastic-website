@@ -184,8 +184,16 @@ private:
         for (int served = 0; served < kMaxRequestsPerConn; ++served) {
             Request request;
             const ReadResult result = read_http_request(client_fd, request, leftover, max_body_);
-            if (result == ReadResult::Closed || result == ReadResult::Timeout) {
-                // Clean close or idle keep-alive timeout: nothing to answer.
+            if (result == ReadResult::Closed) {
+                // Clean close or idle keep-alive expiry: nothing to answer.
+                break;
+            }
+            if (result == ReadResult::Timeout) {
+                // A partial request stalled past its deadline (slow-drip client):
+                // answer 408 and drop the connection to free the pool worker.
+                Response timeout_response = simple_status(408);
+                timeout_response.extra_headers.emplace_back("Cache-Control", "no-store");
+                send_response(client_fd, std::move(timeout_response), false);
                 break;
             }
 
