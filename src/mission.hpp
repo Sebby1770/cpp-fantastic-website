@@ -134,7 +134,7 @@ inline std::string build_mission_json(const std::map<std::string, std::string>& 
     std::ostringstream json;
     json << "{";
     json << "\"app\":\"AsterForge\",";
-    json << "\"version\":\"" << "1.1.0" << "\",";
+    json << "\"version\":\"" << kVersion << "\",";
     json << "\"seed\":\"" << json_escape(seed_text) << "\",";
     json << "\"mode\":\"" << json_escape(mode) << "\",";
     json << "\"intensity\":" << intensity << ",";

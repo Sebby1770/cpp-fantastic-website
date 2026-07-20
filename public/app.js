@@ -1,3 +1,5 @@
+const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+
 const state = {
   mode: "pulse",
   mission: null,
@@ -6,7 +8,14 @@ const state = {
   constellation: null,
   constellationSeed: Math.floor(Math.random() * 10000),
   pointer: { x: 0.5, y: 0.5, active: false },
-  time: 0
+  time: 0,
+  warp: false,
+  warpAmount: 0,
+  telemetry: { history: [] },
+  shootingStars: [],
+  nextShootingStarAt: 0,
+  prevStarPositions: [],
+  prevNodePositions: []
 };
 
 const elements = {
@@ -30,13 +39,21 @@ const elements = {
   randomizeSeed: document.querySelector("#randomizeSeed"),
   reseedConstellation: document.querySelector("#reseedConstellation"),
   copy: document.querySelector("#copyButton"),
+  warpButton: document.querySelector("#warpButton"),
   metrics: document.querySelector("#metricStrip"),
   priorities: document.querySelector("#priorityList"),
   waypoints: document.querySelector("#waypoints"),
   swatches: document.querySelector("#swatches"),
   paletteName: document.querySelector("#paletteName"),
   palettePicker: document.querySelector("#palettePicker"),
-  modeBadge: document.querySelector("#modeBadge")
+  modeBadge: document.querySelector("#modeBadge"),
+  sparkCanvas: document.querySelector("#sparkCanvas"),
+  rpsValue: document.querySelector("#rpsValue"),
+  latencyP50: document.querySelector("#latencyP50"),
+  latencyP99: document.querySelector("#latencyP99"),
+  statusChips: document.querySelector("#statusChips"),
+  telemetryTick: document.querySelector("#telemetryTick"),
+  shortcutOverlay: document.querySelector("#shortcutOverlay")
 };
 
 const ctx = elements.canvas.getContext("2d");
@@ -48,6 +65,9 @@ function resizeCanvas() {
   elements.canvas.width = Math.max(1, Math.floor(rect.width * scale));
   elements.canvas.height = Math.max(1, Math.floor(rect.height * scale));
   ctx.setTransform(scale, 0, 0, scale, 0, 0);
+  if (reducedMotion.matches) {
+    drawCanvas(false);
+  }
 }
 
 function modeTitle(value) {
@@ -82,8 +102,10 @@ async function checkHealth() {
     const response = await fetch("/api/health");
     if (!response.ok) throw new Error("health check failed");
     const data = await response.json();
-    elements.serverStatus.textContent = "online";
-    elements.serverStatus.classList.add("online");
+    if (!elements.serverStatus.classList.contains("live")) {
+      elements.serverStatus.textContent = "online";
+      elements.serverStatus.classList.add("online");
+    }
     if (elements.uptimeValue) {
       elements.uptimeValue.textContent = formatUptime(data.uptime_seconds);
     }
@@ -95,8 +117,23 @@ async function checkHealth() {
     }
   } catch {
     elements.serverStatus.textContent = "offline";
-    elements.serverStatus.classList.remove("online");
+    elements.serverStatus.classList.remove("online", "live");
   }
+}
+
+function metricsMarkup(data) {
+  const paths = Object.entries(data.by_path || {})
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 6)
+    .map(([path, count]) => `<li><code>${path}</code> <strong>${count}</strong></li>`)
+    .join("");
+  return `
+    <p class="metrics-summary">
+      <span>total <strong>${data.total_requests}</strong></span>
+      <span>up <strong>${formatUptime(data.uptime_seconds)}</strong></span>
+    </p>
+    <ul class="path-metrics">${paths || "<li>No traffic yet</li>"}</ul>
+  `;
 }
 
 async function loadMetrics() {
@@ -105,22 +142,175 @@ async function loadMetrics() {
     const response = await fetch("/api/metrics");
     if (!response.ok) throw new Error("metrics failed");
     const data = await response.json();
-    const paths = Object.entries(data.by_path || {})
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 6)
-      .map(([path, count]) => `<li><code>${path}</code> <strong>${count}</strong></li>`)
-      .join("");
-    elements.serverMetrics.innerHTML = `
-      <p class="metrics-summary">
-        <span>total <strong>${data.total_requests}</strong></span>
-        <span>up <strong>${formatUptime(data.uptime_seconds)}</strong></span>
-      </p>
-      <ul class="path-metrics">${paths || "<li>No traffic yet</li>"}</ul>
-    `;
+    elements.serverMetrics.innerHTML = metricsMarkup(data);
   } catch {
     elements.serverMetrics.textContent = "Metrics unavailable";
   }
 }
+
+/* ---------------------------------------------------------------------------
+ * Live telemetry over Server-Sent Events, with polling as the fallback.
+ * ------------------------------------------------------------------------- */
+
+let pollTimer = null;
+
+function startPolling() {
+  if (pollTimer) return;
+  checkHealth();
+  loadMetrics();
+  pollTimer = window.setInterval(() => {
+    checkHealth();
+    loadMetrics();
+  }, 4000);
+}
+
+function stopPolling() {
+  if (!pollTimer) return;
+  window.clearInterval(pollTimer);
+  pollTimer = null;
+}
+
+function connectTelemetry() {
+  if (!window.EventSource) {
+    startPolling();
+    return;
+  }
+  const source = new EventSource("/api/stream");
+  source.addEventListener("open", () => {
+    stopPolling();
+    elements.serverStatus.textContent = "live";
+    elements.serverStatus.classList.add("online", "live");
+    elements.serverStatus.classList.remove("reconnecting");
+  });
+  source.addEventListener("telemetry", (event) => {
+    let data;
+    try {
+      data = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+    applyTelemetry(data);
+  });
+  source.addEventListener("error", () => {
+    elements.serverStatus.textContent = "reconnecting";
+    elements.serverStatus.classList.remove("online", "live");
+    elements.serverStatus.classList.add("reconnecting");
+    startPolling();
+  });
+}
+
+function applyTelemetry(data) {
+  const history = state.telemetry.history;
+  history.push({ at: performance.now(), total: Number(data.total_requests) || 0 });
+  while (history.length > 60) {
+    history.shift();
+  }
+
+  elements.serverStatus.textContent = "live";
+  elements.serverStatus.classList.add("online", "live");
+  elements.serverStatus.classList.remove("reconnecting");
+  if (elements.uptimeValue) {
+    elements.uptimeValue.textContent = formatUptime(data.uptime_seconds);
+  }
+  if (elements.requestCount) {
+    elements.requestCount.textContent = String(data.total_requests ?? "—");
+  }
+  if (elements.telemetryTick) {
+    elements.telemetryTick.textContent = `tick ${data.tick ?? "—"}`;
+  }
+
+  if (elements.rpsValue) {
+    elements.rpsValue.textContent = requestsPerSecond().toFixed(1);
+  }
+  const latency = data.latency_ms || {};
+  if (elements.latencyP50) {
+    elements.latencyP50.textContent = `${Number(latency.p50 ?? 0).toFixed(2)}ms`;
+  }
+  if (elements.latencyP99) {
+    elements.latencyP99.textContent = `${Number(latency.p99 ?? 0).toFixed(2)}ms`;
+  }
+  renderStatusChips(data.status || {});
+  drawSparkline();
+
+  if (elements.serverMetrics) {
+    elements.serverMetrics.innerHTML = metricsMarkup(data);
+  }
+}
+
+function requestsPerSecond() {
+  const history = state.telemetry.history;
+  if (history.length < 2) return 0;
+  const first = history[Math.max(0, history.length - 6)];
+  const last = history[history.length - 1];
+  const dt = (last.at - first.at) / 1000;
+  if (dt <= 0) return 0;
+  return Math.max(0, (last.total - first.total) / dt);
+}
+
+function renderStatusChips(status) {
+  if (!elements.statusChips) return;
+  const classes = ["2xx", "3xx", "4xx", "5xx"];
+  elements.statusChips.innerHTML = classes.map((name) => `
+    <span class="chip status-${name}"><span>${name}</span><strong>${status[name] ?? 0}</strong></span>
+  `).join("");
+}
+
+function cssColor(name, fallback) {
+  const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return value || fallback;
+}
+
+function drawSparkline() {
+  const canvas = elements.sparkCanvas;
+  if (!canvas) return;
+  const rect = canvas.getBoundingClientRect();
+  const scale = window.devicePixelRatio || 1;
+  const height = rect.height || 64;
+  canvas.width = Math.max(1, Math.floor(rect.width * scale));
+  canvas.height = Math.max(1, Math.floor(height * scale));
+  const sctx = canvas.getContext("2d");
+  sctx.setTransform(scale, 0, 0, scale, 0, 0);
+  sctx.clearRect(0, 0, rect.width, height);
+
+  const history = state.telemetry.history;
+  const deltas = [];
+  for (let i = 1; i < history.length; i += 1) {
+    const dt = (history[i].at - history[i - 1].at) / 1000;
+    deltas.push(dt > 0 ? Math.max(0, (history[i].total - history[i - 1].total) / dt) : 0);
+  }
+  if (!deltas.length) return;
+
+  const max = Math.max(1, ...deltas);
+  const stroke = cssColor("--teal", "#247c76");
+  const stepX = deltas.length > 1 ? rect.width / (deltas.length - 1) : rect.width;
+  const pointY = (value) => height - 4 - (value / max) * (height - 10);
+
+  sctx.beginPath();
+  deltas.forEach((value, index) => {
+    const x = deltas.length > 1 ? index * stepX : rect.width;
+    if (index === 0) {
+      sctx.moveTo(x, pointY(value));
+    } else {
+      sctx.lineTo(x, pointY(value));
+    }
+  });
+  sctx.strokeStyle = stroke;
+  sctx.lineWidth = 2;
+  sctx.lineJoin = "round";
+  sctx.stroke();
+
+  sctx.lineTo(deltas.length > 1 ? (deltas.length - 1) * stepX : rect.width, height);
+  sctx.lineTo(0, height);
+  sctx.closePath();
+  sctx.globalAlpha = 0.14;
+  sctx.fillStyle = stroke;
+  sctx.fill();
+  sctx.globalAlpha = 1;
+}
+
+/* ---------------------------------------------------------------------------
+ * Mission / palettes / constellation data
+ * ------------------------------------------------------------------------- */
 
 async function loadPalettes() {
   if (!elements.palettePicker) return;
@@ -165,6 +355,10 @@ async function loadConstellation() {
     const response = await fetch(`/api/constellation?seed=${state.constellationSeed}&points=${points}`);
     if (!response.ok) throw new Error("constellation failed");
     state.constellation = await response.json();
+    state.prevStarPositions = [];
+    if (reducedMotion.matches) {
+      drawCanvas(false);
+    }
   } catch (error) {
     console.warn("constellation endpoint unavailable", error);
     state.constellation = null;
@@ -181,8 +375,12 @@ async function loadMission() {
       state.paletteId = state.mission.paletteId;
       renderPalettePicker();
     }
+    state.prevNodePositions = [];
     renderMission();
     await loadConstellation();
+    if (reducedMotion.matches) {
+      drawCanvas(false);
+    }
   } catch (error) {
     elements.missionName.textContent = "Signal interrupted";
     elements.missionTagline.textContent = "The C++ server did not return a mission packet.";
@@ -222,6 +420,135 @@ function renderMission() {
   elements.swatches.innerHTML = mission.palette.map((color) => `
     <span class="swatch" style="background:${color}" title="${color}"></span>
   `).join("");
+
+  buildNebula(mission.palette);
+}
+
+/* ---------------------------------------------------------------------------
+ * Canvas rendering: nebula, grid, constellation, nodes, shooting stars, warp
+ * ------------------------------------------------------------------------- */
+
+const nebula = { blobs: [], paletteKey: "" };
+
+function hexToRgba(hex, alpha) {
+  const value = (hex || "").replace("#", "");
+  if (value.length !== 6) return `rgba(36, 124, 118, ${alpha})`;
+  const r = parseInt(value.slice(0, 2), 16);
+  const g = parseInt(value.slice(2, 4), 16);
+  const b = parseInt(value.slice(4, 6), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+function buildNebula(palette) {
+  const key = (palette || []).join(",");
+  if (!palette || nebula.paletteKey === key) return;
+  nebula.paletteKey = key;
+  nebula.blobs = [2, 3, 5].map((paletteIndex, index) => {
+    const size = 420 + index * 170;
+    const canvas = document.createElement("canvas");
+    canvas.width = size;
+    canvas.height = size;
+    const bctx = canvas.getContext("2d");
+    const gradient = bctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+    gradient.addColorStop(0, hexToRgba(palette[paletteIndex], 0.08));
+    gradient.addColorStop(0.65, hexToRgba(palette[paletteIndex], 0.04));
+    gradient.addColorStop(1, hexToRgba(palette[paletteIndex], 0));
+    bctx.fillStyle = gradient;
+    bctx.fillRect(0, 0, size, size);
+    return { canvas, speed: 0.24 + index * 0.14, phaseX: index * 2.1, phaseY: 1.1 + index * 1.4 };
+  });
+}
+
+function drawNebula(width, height) {
+  nebula.blobs.forEach((blob) => {
+    const x = width * (0.5 + 0.34 * Math.sin(state.time * blob.speed + blob.phaseX)) - blob.canvas.width / 2;
+    const y = height * (0.5 + 0.3 * Math.cos(state.time * blob.speed * 0.8 + blob.phaseY)) - blob.canvas.height / 2;
+    ctx.drawImage(blob.canvas, x, y);
+  });
+}
+
+function maybeSpawnShootingStar(width, height) {
+  if (reducedMotion.matches) return;
+  const now = performance.now();
+  if (state.nextShootingStarAt === 0) {
+    state.nextShootingStarAt = now + 4000 + Math.random() * 5000;
+    return;
+  }
+  if (now < state.nextShootingStarAt) return;
+  state.nextShootingStarAt = now + 4000 + Math.random() * 5000;
+  const fromTop = Math.random() < 0.5;
+  state.shootingStars.push({
+    x: fromTop ? Math.random() * width * 0.8 : -24,
+    y: fromTop ? -24 : Math.random() * height * 0.45,
+    vx: 6 + Math.random() * 5,
+    vy: 3.2 + Math.random() * 2.6,
+    trail: []
+  });
+}
+
+function drawShootingStars(width, height, palette) {
+  if (!state.shootingStars.length) return;
+  ctx.save();
+  ctx.lineCap = "round";
+  state.shootingStars = state.shootingStars.filter((star) => {
+    star.trail.push({ x: star.x, y: star.y });
+    if (star.trail.length > 12) {
+      star.trail.shift();
+    }
+    star.x += star.vx;
+    star.y += star.vy;
+
+    for (let i = 1; i < star.trail.length; i += 1) {
+      const a = star.trail[i - 1];
+      const b = star.trail[i];
+      ctx.globalAlpha = (i / star.trail.length) * 0.55;
+      ctx.strokeStyle = palette[1] || "#f7f2e8";
+      ctx.lineWidth = 1 + (i / star.trail.length) * 1.6;
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 0.9;
+    ctx.fillStyle = palette[1] || "#f7f2e8";
+    ctx.beginPath();
+    ctx.arc(star.x, star.y, 1.8, 0, Math.PI * 2);
+    ctx.fill();
+
+    return star.x < width + 40 && star.y < height + 40;
+  });
+  ctx.restore();
+}
+
+function warpPosition(x, y, width, height) {
+  if (state.warpAmount < 0.01) return { x, y };
+  const cx = width / 2;
+  const cy = height / 2;
+  const tempoScale = 0.6 + Number(elements.tempo.value) / 55;
+  const pulse = 1 + state.warpAmount *
+    (0.16 + 0.24 * (0.5 + 0.5 * Math.sin(state.time * 2.6 * tempoScale)));
+  return { x: cx + (x - cx) * pulse, y: cy + (y - cy) * pulse };
+}
+
+function drawWarpStreaks(current, previous, color) {
+  if (state.warpAmount < 0.05) return;
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineCap = "round";
+  current.forEach((point, index) => {
+    const prev = previous[index];
+    if (!prev) return;
+    const dx = point.x - prev.x;
+    const dy = point.y - prev.y;
+    if (dx * dx + dy * dy < 0.4) return;
+    ctx.globalAlpha = 0.35 * state.warpAmount;
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(prev.x, prev.y);
+    ctx.lineTo(point.x, point.y);
+    ctx.stroke();
+  });
+  ctx.restore();
 }
 
 function drawGrid(width, height, palette) {
@@ -252,15 +579,21 @@ function drawConstellationLayer(width, height, palette) {
   const pack = state.constellation;
   if (!pack || !pack.stars) return;
 
+  const drifting = !reducedMotion.matches;
   const stars = pack.stars.map((star, index) => {
-    const drift = Math.sin(state.time * 0.9 + index) * 4;
+    const drift = drifting ? Math.sin(state.time * 0.9 + index) * 4 : 0;
+    const wobble = drifting ? Math.cos(state.time * 0.7 + index) * 3 : 0;
+    const warped = warpPosition(star.x * width + drift, star.y * height + wobble, width, height);
     return {
-      x: star.x * width + drift,
-      y: star.y * height + Math.cos(state.time * 0.7 + index) * 3,
+      x: warped.x,
+      y: warped.y,
       size: star.size,
       brightness: star.brightness
     };
   });
+
+  drawWarpStreaks(stars, state.prevStarPositions, palette[1] || "#f7f2e8");
+  state.prevStarPositions = stars.map((star) => ({ x: star.x, y: star.y }));
 
   ctx.save();
   if (pack.links) {
@@ -288,11 +621,14 @@ function drawConstellationLayer(width, height, palette) {
   ctx.restore();
 }
 
-function drawCanvas() {
+function drawCanvas(advance = true) {
   const width = elements.canvas.clientWidth;
   const height = elements.canvas.clientHeight;
   const mission = state.mission;
-  state.time += 0.008 + Number(elements.tempo.value) / 28000;
+  if (advance) {
+    state.time += 0.008 + Number(elements.tempo.value) / 28000;
+    state.warpAmount += ((state.warp ? 1 : 0) - state.warpAmount) * 0.06;
+  }
 
   ctx.clearRect(0, 0, width, height);
   ctx.fillStyle = "#171717";
@@ -300,20 +636,28 @@ function drawCanvas() {
 
   if (mission) {
     const palette = mission.palette;
+    drawNebula(width, height);
     drawGrid(width, height, palette);
     drawConstellationLayer(width, height, palette);
 
+    const drifting = !reducedMotion.matches;
     const nodes = mission.nodes.map((node, index) => {
-      const drift = Math.sin(state.time * (1.5 + index * 0.03) + index) * 10;
+      const drift = drifting ? Math.sin(state.time * (1.5 + index * 0.03) + index) * 10 : 0;
+      const wobble = drifting ? Math.cos(state.time + index) * 8 : 0;
       const pullX = state.pointer.active ? (state.pointer.x - 0.5) * 24 : 0;
       const pullY = state.pointer.active ? (state.pointer.y - 0.5) * 24 : 0;
+      const warped = warpPosition(node.x * width + drift + pullX,
+                                  node.y * height + wobble + pullY, width, height);
       return {
-        x: node.x * width + drift + pullX,
-        y: node.y * height + Math.cos(state.time + index) * 8 + pullY,
+        x: warped.x,
+        y: warped.y,
         size: node.size,
         energy: node.energy
       };
     });
+
+    drawWarpStreaks(nodes, state.prevNodePositions, palette[2] || "#247c76");
+    state.prevNodePositions = nodes.map((node) => ({ x: node.x, y: node.y }));
 
     ctx.save();
     ctx.lineWidth = 1.4;
@@ -346,6 +690,9 @@ function drawCanvas() {
       ctx.restore();
     });
 
+    maybeSpawnShootingStar(width, height);
+    drawShootingStars(width, height, palette);
+
     if (state.pointer.active) {
       ctx.save();
       ctx.strokeStyle = palette[5] || "#6e62a6";
@@ -357,8 +704,107 @@ function drawCanvas() {
       ctx.restore();
     }
   }
+}
 
-  requestAnimationFrame(drawCanvas);
+let animating = false;
+
+function animationLoop() {
+  if (!animating) return;
+  drawCanvas(true);
+  requestAnimationFrame(animationLoop);
+}
+
+function startAnimation() {
+  if (reducedMotion.matches) {
+    drawCanvas(false);
+    return;
+  }
+  if (animating) return;
+  animating = true;
+  requestAnimationFrame(animationLoop);
+}
+
+reducedMotion.addEventListener("change", () => {
+  if (reducedMotion.matches) {
+    animating = false;
+    setWarp(false);
+    state.shootingStars = [];
+    drawCanvas(false);
+  } else {
+    startAnimation();
+  }
+});
+
+/* ---------------------------------------------------------------------------
+ * Warp mode, keyboard shortcuts, overlay
+ * ------------------------------------------------------------------------- */
+
+function setWarp(on) {
+  if (reducedMotion.matches) {
+    on = false;
+  }
+  state.warp = on;
+  if (elements.warpButton) {
+    elements.warpButton.classList.toggle("active", on);
+    elements.warpButton.setAttribute("aria-pressed", String(on));
+  }
+}
+
+function toggleShortcutOverlay(force) {
+  const overlay = elements.shortcutOverlay;
+  if (!overlay) return;
+  const show = force !== undefined ? force : overlay.hidden;
+  overlay.hidden = !show;
+}
+
+function setMode(mode) {
+  const button = document.querySelector(`.mode-button[data-mode="${mode}"]`);
+  if (button && !button.classList.contains("active")) {
+    button.click();
+  }
+}
+
+function isTypingTarget(target) {
+  return target instanceof HTMLInputElement ||
+    target instanceof HTMLTextAreaElement ||
+    target instanceof HTMLSelectElement ||
+    (target instanceof HTMLElement && target.isContentEditable);
+}
+
+function bindShortcuts() {
+  window.addEventListener("keydown", (event) => {
+    if (isTypingTarget(event.target)) return;
+    if (event.metaKey || event.ctrlKey || event.altKey) return;
+    switch (event.key) {
+      case "g":
+        loadMission();
+        break;
+      case "r":
+        elements.reseedConstellation?.click();
+        break;
+      case "w":
+        setWarp(!state.warp);
+        break;
+      case "1":
+        setMode("pulse");
+        break;
+      case "2":
+        setMode("route");
+        break;
+      case "3":
+        setMode("forge");
+        break;
+      case "?":
+        toggleShortcutOverlay();
+        break;
+      case "Escape":
+        toggleShortcutOverlay(false);
+        break;
+      default:
+        return;
+    }
+    event.preventDefault();
+  });
 }
 
 function bindEvents() {
@@ -397,6 +843,18 @@ function bindEvents() {
     });
   }
 
+  if (elements.warpButton) {
+    elements.warpButton.addEventListener("click", () => setWarp(!state.warp));
+  }
+
+  if (elements.shortcutOverlay) {
+    elements.shortcutOverlay.addEventListener("click", (event) => {
+      if (event.target === elements.shortcutOverlay) {
+        toggleShortcutOverlay(false);
+      }
+    });
+  }
+
   elements.copy.addEventListener("click", async () => {
     if (!state.mission) return;
     await navigator.clipboard.writeText(JSON.stringify(state.mission, null, 2));
@@ -423,13 +881,10 @@ function bindEvents() {
 
 resizeCanvas();
 bindEvents();
+bindShortcuts();
 checkHealth();
 loadPalettes();
 loadMission();
 loadMetrics();
-drawCanvas();
-
-window.setInterval(() => {
-  checkHealth();
-  loadMetrics();
-}, 4000);
+connectTelemetry();
+startAnimation();
