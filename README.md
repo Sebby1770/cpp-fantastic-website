@@ -39,7 +39,11 @@ http://localhost:8080
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/health` | Liveness: `status`, `version`, `uptime_seconds`, `request_count` |
+| `GET` | `/api/health` |
+| `GET` | `/api/version` | Version + endpoint list |
+| `GET` | `/api/time` | Server UTC time |
+| `GET` | `/api/random` | Seeded random int (`seed`,`min`,`max`) |
+| `GET` | `/api/status` | Richer health snapshot | Liveness: `status`, `version`, `uptime_seconds`, `request_count` |
 | `GET` | `/api/mission` | Mission packet (seed, mode, intensity, tempo, optional `palette`) |
 | `GET` | `/api/palettes` | Named color palettes |
 | `GET` | `/api/constellation` | Star points for the canvas (`seed`, `points`) |
@@ -69,7 +73,7 @@ http://localhost:8080
 
 ```bash
 curl -s http://localhost:8080/api/health
-# {"status":"ok","service":"AsterForge","language":"C++17","version":"1.1.0",...}
+# {"status":"ok","service":"AsterForge","language":"C++17","version":"1.2.0",...}
 
 curl -s "http://localhost:8080/api/constellation?seed=7&points=12"
 curl -s -X POST http://localhost:8080/api/echo -H 'Content-Type: application/json' -d '{"ping":1}'
@@ -125,4 +129,4 @@ Client ──► Server::handle_client
               └─ send_response (CORS, nosniff, HEAD-safe)
 ```
 
-Version: **1.1.0**
+Version: **1.2.0**
