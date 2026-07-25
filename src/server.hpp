@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <iostream>
 #include <optional>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -368,8 +369,89 @@ private:
             }
         }
 
+        if (request.path == "/api/version") {
+            if (method == "POST") {
+                return method_not_allowed();
+            }
+            std::ostringstream json;
+            json << "{";
+            json << "\"service\":\"AsterForge\",";
+            json << "\"version\":\"" << kVersion << "\",";
+            json << "\"language\":\"C++17\",";
+            json << "\"endpoints\":[\"/api/health\",\"/api/version\",\"/api/time\",\"/api/random\","
+                    "\"/api/status\",\"/api/mission\",\"/api/palettes\",\"/api/constellation\","
+                    "\"/api/metrics\",\"/api/stream\",\"/api/echo\"]";
+            json << "}";
+            return json_response(json.str());
+        }
+
+        if (request.path == "/api/time") {
+            if (method == "POST") {
+                return method_not_allowed();
+            }
+            const auto now = std::chrono::system_clock::now();
+            const auto unix_s =
+                std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+            std::ostringstream json;
+            json << "{";
+            json << "\"iso\":\"" << current_time_iso() << "\",";
+            json << "\"unix\":" << unix_s;
+            json << "}";
+            return json_response(json.str());
+        }
+
+        if (request.path == "/api/random") {
+            if (method == "POST") {
+                return method_not_allowed();
+            }
+            const int lo = int_param(request.query, "min", 0, -1000000, 1000000);
+            const int hi = int_param(request.query, "max", 100, -1000000, 1000000);
+            const int min_v = std::min(lo, hi);
+            const int max_v = std::max(lo, hi);
+            const std::string seed = string_param(request.query, "seed", "aster", 64);
+            std::mt19937 rng(stable_seed(seed + ":" + std::to_string(min_v) + ":" +
+                                         std::to_string(max_v)));
+            std::uniform_int_distribution<int> dist(min_v, max_v);
+            const int value = dist(rng);
+            std::ostringstream json;
+            json << "{";
+            json << "\"seed\":\"" << json_escape(seed) << "\",";
+            json << "\"min\":" << min_v << ",";
+            json << "\"max\":" << max_v << ",";
+            json << "\"value\":" << value;
+            json << "}";
+            return json_response(json.str());
+        }
+
+        if (request.path == "/api/status") {
+            if (method == "POST") {
+                return method_not_allowed();
+            }
+            std::ostringstream json;
+            json << "{";
+            json << "\"status\":\"ok\",";
+            json << "\"service\":\"AsterForge\",";
+            json << "\"version\":\"" << kVersion << "\",";
+            json << "\"uptime_seconds\":" << metrics_.uptime_seconds() << ",";
+            json << "\"request_count\":" << metrics_.total_requests() << ",";
+            json << "\"public_dir\":\"" << json_escape(public_dir_.string()) << "\",";
+            json << "\"port\":" << port_;
+            json << "}";
+            return json_response(json.str());
+        }
+
         if (method == "POST") {
             return method_not_allowed();
+        }
+
+        // Unknown /api/* routes return a JSON 404 (rather than the HTML/static
+        // 404) so API clients always receive a machine-readable body.
+        if (request.path.rfind("/api/", 0) == 0) {
+            std::ostringstream json;
+            json << "{\"error\":\"not_found\",\"path\":\"" << json_escape(request.path) << "\"}";
+            Response response = json_response(json.str(), 404, status_text_for(404));
+            response.extra_headers.emplace_back("Cache-Control", "no-store");
+            return response;
         }
 
         return serve_static(request);
