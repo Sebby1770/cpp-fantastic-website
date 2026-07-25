@@ -13,6 +13,19 @@ in parallel — both feature sets ship together.
 - Carried over from 1.2: `GET /api/version`, `/api/time`, `/api/random`,
   `/api/status`, and a JSON `404` body for unknown `/api/*` paths, now served
   by the 2.x worker-pool dispatch. `/api/version` lists `/api/stream` too.
+- `--log-format json|text`. JSON is the default, restoring the structured
+  request logging 1.2 introduced, now with a timestamp, client IP and
+  sub-millisecond latency, and still mutex-serialized so concurrent workers
+  cannot tear a line.
+
+### Fixed
+
+- **Access log was invisible on a running server.** `std::cout` is block
+  buffered when redirected to a file, so log lines sat in a 4 KiB buffer until
+  it filled or the process exited — `tail -f` on a live server showed nothing.
+  Each line is now flushed as it is written.
+- The 1.2 log reported latency as truncated integer milliseconds, which showed
+  `0` for essentially every request; latency is now sub-millisecond.
 
 ### Changed
 

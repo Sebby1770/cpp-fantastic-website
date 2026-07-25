@@ -1,4 +1,5 @@
 #include "http.hpp"
+#include "log.hpp"
 #include "metrics.hpp"
 #include "rate_limiter.hpp"
 #include "server.hpp"
@@ -462,6 +463,50 @@ int main() {
     expect_true("stable_seed empty fnv basis", aster::stable_seed("") == 2166136261u);
 
     expect_eq("version constant", std::string(aster::kVersion), "2.2.0");
+
+    // Access log: both formats, and the sub-millisecond precision that an
+    // integer-millisecond log would report as a useless "0" for most handlers.
+    {
+        using aster::LogFormat;
+        aster::Request log_req;
+        log_req.method = "GET";
+        log_req.target = "/api/health?seed=a";
+        log_req.path = "/api/health";
+        log_req.version = "HTTP/1.1";
+
+        const std::string json = aster::format_access_log(
+            LogFormat::Json, "127.0.0.1", log_req, 200, 142, std::chrono::microseconds(310));
+        expect_true("log json method", json.find("\"method\":\"GET\"") != std::string::npos);
+        expect_true("log json path", json.find("\"path\":\"/api/health\"") != std::string::npos);
+        expect_true("log json status", json.find("\"status\":200") != std::string::npos);
+        expect_true("log json bytes", json.find("\"bytes\":142") != std::string::npos);
+        expect_true("log json ip", json.find("\"ip\":\"127.0.0.1\"") != std::string::npos);
+        expect_true("log json sub-ms precision", json.find("\"ms\":0.31") != std::string::npos);
+        expect_true("log json is one object", json.front() == '{' && json.back() == '}');
+        expect_true("log json single line", json.find('\n') == std::string::npos);
+
+        const std::string text = aster::format_access_log(
+            LogFormat::Text, "127.0.0.1", log_req, 404, 9, std::chrono::microseconds(1500));
+        expect_true("log text request line",
+                    text.find("\"GET /api/health?seed=a HTTP/1.1\"") != std::string::npos);
+        expect_true("log text status", text.find(" 404 9 ") != std::string::npos);
+        expect_true("log text ms suffix", text.find("1.50ms") != std::string::npos);
+
+        // A quoted path must not break out of the JSON string.
+        aster::Request evil;
+        evil.method = "GET";
+        evil.path = "/a\"b";
+        evil.version = "HTTP/1.1";
+        const std::string escaped = aster::format_access_log(
+            LogFormat::Json, "1.2.3.4", evil, 200, 0, std::chrono::microseconds(0));
+        expect_true("log json escapes quotes",
+                    escaped.find("\"path\":\"/a\\\"b\"") != std::string::npos);
+
+        expect_true("log format parses text",
+                    aster::log_format_from_string("TEXT") == LogFormat::Text);
+        expect_true("log format defaults json",
+                    aster::log_format_from_string("anything") == LogFormat::Json);
+    }
     const auto q = parse_query("seed=alpha&min=1&max=10");
     expect_eq("query seed", q.at("seed"), "alpha");
     expect_eq("query min", q.at("min"), "1");

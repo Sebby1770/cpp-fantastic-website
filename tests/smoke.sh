@@ -242,16 +242,56 @@ fi
 SHUTDOWN_STATUS=0
 wait "$PID2" || SHUTDOWN_STATUS=$?
 [ "$SHUTDOWN_STATUS" -eq 0 ]
-grep -q '"GET /api/health HTTP/1.1" 200' "$LOG2"
-grep -q 'ms' "$LOG2"
+# Default format is JSON: the request line must be a real, parseable object
+# carrying the documented fields (not just text that looks JSON-ish).
+JSON_LINE=$(grep '^{"time"' "$LOG2" | head -1)
+[ -n "$JSON_LINE" ]
+echo "$JSON_LINE" | python3 -c '
+import json, sys
+entry = json.load(sys.stdin)
+for key in ("time", "ip", "method", "path", "status", "bytes", "ms"):
+    assert key in entry, f"missing {key}"
+assert entry["method"] == "GET", entry
+assert entry["path"] == "/api/health", entry
+assert entry["status"] == 200, entry
+assert isinstance(entry["ms"], (int, float)), entry
+'
 grep -q 'AsterForge shutting down' "$LOG2"
+
+echo "== access log --log-format text =="
+PORT5=$((PORT + 4))
+LOG5=/tmp/asterforge-smoke5.log
+"$ROOT_DIR/build/cpp_fantastic_website" --port "$PORT5" --log-format text > "$LOG5" 2>&1 &
+PID5=$!
+# Register immediately: a failing assertion below must not leak a server that
+# then squats the port and breaks every later run.
+trap 'kill "$SERVER_PID" "$PID2" "$PID3" "$PID5" >/dev/null 2>&1 || true' EXIT
+for _ in {1..40}; do
+  if curl -fsS "http://localhost:$PORT5/api/health" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.15
+done
+curl -fsS "http://localhost:$PORT5/api/health" >/dev/null
+# The access line is written after the response is sent, so poll for it rather
+# than assuming it has landed by the time curl returns.
+for _ in {1..40}; do
+  grep -q '"GET /api/health HTTP/1.1" 200' "$LOG5" && break
+  sleep 0.1
+done
+grep -q '"GET /api/health HTTP/1.1" 200' "$LOG5"
+grep -q 'ms' "$LOG5"
+# Text mode must not emit JSON objects.
+! grep -q '^{"time"' "$LOG5"
+kill "$PID5" >/dev/null 2>&1 || true
+wait "$PID5" 2>/dev/null || true
 
 echo "== graceful shutdown with open SSE stream =="
 PORT4=$((PORT + 3))
 LOG4=/tmp/asterforge-smoke4.log
 "$ROOT_DIR/build/cpp_fantastic_website" --port "$PORT4" --quiet > "$LOG4" 2>&1 &
 PID4=$!
-trap 'kill "$SERVER_PID" "$PID2" "$PID3" "$PID4" >/dev/null 2>&1 || true' EXIT
+trap 'kill "$SERVER_PID" "$PID2" "$PID3" "$PID4" "$PID5" >/dev/null 2>&1 || true' EXIT
 for _ in {1..40}; do
   if curl -fsS "http://localhost:$PORT4/api/health" >/dev/null 2>&1; then
     break

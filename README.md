@@ -14,7 +14,7 @@
 - **Traversal defense** — canonical-path containment (symlink escapes and NUL bytes rejected)
 - **Per-IP rate limiting** — token bucket (`--rate-limit`), `429` + `Retry-After`
 - **Live telemetry** — `GET /api/stream` Server-Sent Events pushing metrics snapshots every second; deep metrics with status-class counters and latency `mean`/`max`/`p50`/`p99`
-- **Structured access log** — per-request line with status and latency, mutex-serialized
+- **Structured access log** — JSON by default (`--log-format json|text`), one object per request with time, IP, method, path, status, bytes and sub-millisecond latency; mutex-serialized and flushed per line so `tail -f` works on a live server
 - **Frontend workspace** — live telemetry dashboard fed by SSE, nebula layers, shooting stars, warp mode, keyboard shortcuts, `prefers-reduced-motion` support, mobile layout
 - **Quality gates** — 100+ unit tests, end-to-end smoke suite, CI matrix (g++/clang++) plus an ASan+UBSan job
 
@@ -34,6 +34,7 @@ Optional flags:
 | `--threads N` | Worker pool size (default: hardware concurrency, clamped 2–32) |
 | `--max-body BYTES` | Max request body size (default 1 MiB; larger → `413`) |
 | `--rate-limit N` | Sustained requests/sec per IP (default `50`, `0` disables) |
+| `--log-format json\|text` | Access-log format (default `json`) |
 | `--quiet` / `-q` | Disable per-request access logging |
 | `--help` / `-h` | Show usage |
 
@@ -119,7 +120,7 @@ cmake -S . -B build && cmake --build build && ./build/aster_unit_tests
 ctest --test-dir build --output-on-failure
 ```
 
-The smoke suite builds the server, starts it on port `8097` (override with `PORT=`), and exercises: health/mission/palettes/constellation/echo APIs, HEAD/OPTIONS, security headers, keep-alive reuse, oversized-body `413`, header-cap `431`, 50-way concurrency, ETag/`304` conditional GETs, `Range` requests (`206`/`Content-Range`/`416`), gzip sidecar negotiation, path-traversal probes, per-IP `429` rate limiting, `405` `Allow`, echo JSON validity, SSE streaming, access-log format, and graceful shutdown (including with an open SSE stream) with exit code `0`.
+The smoke suite builds the server, starts it on port `8097` (override with `PORT=`), and exercises: health/mission/palettes/constellation/echo APIs, HEAD/OPTIONS, security headers, keep-alive reuse, oversized-body `413`, header-cap `431`, 50-way concurrency, ETag/`304` conditional GETs, `Range` requests (`206`/`Content-Range`/`416`), gzip sidecar negotiation, path-traversal probes, per-IP `429` rate limiting, `405` `Allow`, echo JSON validity, SSE streaming, access-log format (JSON parsed and field-checked, plus `--log-format text`), and graceful shutdown (including with an open SSE stream) with exit code `0`.
 
 CI runs the full suite under g++ and clang++, plus a dedicated ASan+UBSan job.
 
@@ -135,7 +136,7 @@ CI runs the full suite under g++ and clang++, plus a dedicated ASan+UBSan job.
 |-- src/
 |   |-- main.cpp            # Thin entry + signals
 |   |-- http.hpp            # Request / Response / parse / send / limits
-|   |-- log.hpp             # Mutex-serialized access log
+|   |-- log.hpp             # Mutex-serialized access log (JSON / text)
 |   |-- metrics.hpp         # Thread-safe counters + latency ring
 |   |-- mission.hpp         # Mission, palettes, constellation JSON
 |   |-- rate_limiter.hpp    # Per-IP token bucket

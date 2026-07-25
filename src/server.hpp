@@ -40,6 +40,7 @@ struct CliOptions {
     unsigned threads = default_thread_count();
     std::size_t max_body = kMaxBodyBytes;
     double rate_limit = 50.0;  // sustained requests/sec per IP; 0 disables
+    LogFormat log_format = LogFormat::Json;
 };
 
 // Resolve a request path to a file inside public_dir, or nullopt when the
@@ -91,6 +92,7 @@ public:
         : port_(options.port),
           public_dir_(std::move(public_dir)),
           quiet_(options.quiet),
+          log_format_(options.log_format),
           max_body_(options.max_body),
           rate_limit_(options.rate_limit),
           limiter_(options.rate_limit * 2.0, options.rate_limit),
@@ -240,7 +242,8 @@ private:
             metrics_.record(request.path.empty() ? "/" : request.path, response.status, latency);
 
             if (!quiet_) {
-                access_log(client_ip, request, response.status, response.body.size(), latency);
+                access_log(log_format_, client_ip, request, response.status, response.body.size(),
+                           latency);
             }
 
             if (!send_response(client_fd, response, keep_alive) || !keep_alive) {
@@ -261,7 +264,7 @@ private:
             std::chrono::steady_clock::now() - started);
         metrics_.record(request.path, status, latency);
         if (!quiet_) {
-            access_log(client_ip, request, status, 0, latency);
+            access_log(log_format_, client_ip, request, status, 0, latency);
         }
         if (!acquired) {
             Response response = json_response("{\"error\":\"too_many_streams\"}", 503,
@@ -565,6 +568,7 @@ private:
     int port_;
     fs::path public_dir_;
     bool quiet_;
+    LogFormat log_format_;
     std::size_t max_body_;
     double rate_limit_;
     RateLimiter limiter_;
@@ -600,12 +604,14 @@ inline CliOptions parse_cli(int argc, char** argv) {
             options.max_body = static_cast<std::size_t>(std::max(1L, std::stol(argv[++i])));
         } else if (arg == "--rate-limit" && i + 1 < argc) {
             options.rate_limit = std::max(0.0, std::stod(argv[++i]));
+        } else if (arg == "--log-format" && i + 1 < argc) {
+            options.log_format = log_format_from_string(argv[++i]);
         } else if (arg == "--quiet" || arg == "-q") {
             options.quiet = true;
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "AsterForge " << kVersion << "\n"
                       << "Usage: cpp_fantastic_website [--port N] [--threads N] [--max-body BYTES]"
-                      << " [--rate-limit N] [--quiet]\n";
+                      << " [--rate-limit N] [--log-format json|text] [--quiet]\n";
             std::exit(0);
         }
     }
