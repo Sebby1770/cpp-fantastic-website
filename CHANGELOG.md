@@ -3,6 +3,30 @@
 All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.1.0] - 2026-07-24
+
+### Added
+
+- **HTTP Range requests** for static files: `Accept-Ranges: bytes` on every
+  static response, single-range `Range` support (`start-end`, `start-`,
+  `-suffix`) → `206 Partial Content` with `Content-Range`, and `416` with
+  `Content-Range: bytes */<len>` for unsatisfiable ranges. Multi-range requests
+  fall back to a normal `200` (a server may ignore a Range form it does not
+  serve).
+- **Transparent gzip** content negotiation: when the client sends
+  `Accept-Encoding: gzip` (honoring an explicit `q=0`) and a pre-built
+  `<file>.gz` sidecar exists, it is served with `Content-Encoding: gzip`, a
+  distinct representation `ETag` (`…-gz`), and `Vary: Accept-Encoding`. No
+  request-time compression — zero added CPU and still zero runtime dependencies.
+
+### Tests
+
+- Unit coverage for `parse_byte_range` (closed/open/suffix ranges, clamping,
+  inverted and out-of-range specs, empty representation) and `accepts_gzip`
+  (q-values, `x-gzip`, casing, lists).
+- Smoke coverage exercising `206`/`Content-Range`/`416` and gzip sidecar
+  negotiation (including byte-identical decode and `q=0` refusal).
+
 ## [2.0.0] - 2026-07-19
 
 ### Added

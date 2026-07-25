@@ -115,6 +115,42 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "If-Modified-Since: $LASTMOD" "
 [ "$CODE" = "304" ]
 curl -sD - -o /dev/null "$BASE/api/health" | grep -qi 'Cache-Control: no-store'
 
+echo "== range requests (206 / Content-Range / 416) =="
+echo "$CSS_HDRS" | grep -qi '^Accept-Ranges: bytes'
+FULL_LEN=$(echo "$CSS_HDRS" | grep -i '^Content-Length:' | awk '{print $2}' | tr -d '\r')
+RANGE_HDRS=$(curl -sD - -o /tmp/asterforge-range.bin -H 'Range: bytes=0-9' "$BASE/styles.css")
+echo "$RANGE_HDRS" | grep -qiE 'HTTP/1\.[01] 206'
+echo "$RANGE_HDRS" | grep -qi "Content-Range: bytes 0-9/$FULL_LEN"
+[ "$(wc -c < /tmp/asterforge-range.bin | tr -d ' ')" = "10" ]
+# The partial body must equal the first 10 bytes of the real file.
+head -c 10 public/styles.css > /tmp/asterforge-range-expect.bin
+cmp -s /tmp/asterforge-range.bin /tmp/asterforge-range-expect.bin
+# Suffix range: last 16 bytes.
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -H 'Range: bytes=-16' "$BASE/styles.css")
+[ "$CODE" = "206" ]
+# Unsatisfiable range -> 416 with a Content-Range: bytes */<len> header.
+UNSAT_HDRS=$(curl -sD - -o /dev/null -H 'Range: bytes=99999999-' "$BASE/styles.css")
+echo "$UNSAT_HDRS" | grep -qiE 'HTTP/1\.[01] 416'
+echo "$UNSAT_HDRS" | grep -qi "Content-Range: bytes \*/$FULL_LEN"
+rm -f /tmp/asterforge-range.bin /tmp/asterforge-range-expect.bin
+
+echo "== gzip sidecar negotiation =="
+# Create a .gz sidecar next to a served file, then confirm negotiation.
+gzip -9 -c public/styles.css > public/styles.css.gz
+GZ_HDRS=$(curl -sD - -o /dev/null -H 'Accept-Encoding: gzip' "$BASE/styles.css")
+echo "$GZ_HDRS" | grep -qi '^Content-Encoding: gzip'
+echo "$GZ_HDRS" | grep -qi '^Vary: Accept-Encoding'
+# The gzip representation must have its own ETag (…-gz).
+echo "$GZ_HDRS" | grep -i '^ETag:' | grep -q 'gz"'
+# Decoded gzip body must equal the original file.
+curl -s -H 'Accept-Encoding: gzip' --compressed "$BASE/styles.css" | cmp -s - public/styles.css
+# No Accept-Encoding -> identity (no Content-Encoding header).
+curl -sD - -o /dev/null "$BASE/styles.css" | grep -qiv '^Content-Encoding:'
+# gzip;q=0 explicitly refuses gzip.
+curl -sD - -o /dev/null -H 'Accept-Encoding: gzip;q=0' "$BASE/styles.css" \
+  | { ! grep -qi '^Content-Encoding: gzip'; }
+rm -f public/styles.css.gz
+
 echo "== path traversal defense =="
 CODE=$(curl -s -o /dev/null -w '%{http_code}' --path-as-is "$BASE/../src/main.cpp")
 [ "$CODE" = "400" ] || [ "$CODE" = "404" ]

@@ -393,9 +393,27 @@ private:
             return not_found();
         }
 
-        const std::string body = read_file(file_path);
-        const std::string etag =
-            "\"" + weak_hash_hex(body) + "-" + std::to_string(body.size()) + "\"";
+        // Content negotiation: serve a pre-compressed `<file>.gz` sidecar when
+        // the client accepts gzip and one exists. Nothing is compressed at
+        // request time — this stays dependency-free and costs no CPU.
+        bool gzipped = false;
+        fs::path payload_path = file_path;
+        const auto accept_encoding = request.headers.find("accept-encoding");
+        if (accept_encoding != request.headers.end() && accepts_gzip(accept_encoding->second)) {
+            fs::path candidate = file_path;
+            candidate += ".gz";
+            std::error_code gz_ec;
+            if (fs::is_regular_file(candidate, gz_ec)) {
+                payload_path = candidate;
+                gzipped = true;
+            }
+        }
+
+        const std::string body = read_file(payload_path);
+        // The ETag identifies the *representation*, so the gzip and identity
+        // forms must never share one.
+        const std::string etag = "\"" + weak_hash_hex(body) + "-" +
+                                 std::to_string(body.size()) + (gzipped ? "-gz" : "") + "\"";
         std::error_code ec;
         const auto mtime = fs::last_write_time(file_path, ec);
         const std::string last_modified = ec ? std::string{} : http_date(mtime);
@@ -418,8 +436,44 @@ private:
             not_modified
                 ? Response{304, status_text_for(304), mime_type(file_path), "", true, {}}
                 : Response{200, "OK", mime_type(file_path), body, true, {}};
+
+        // Range requests apply to the selected representation, so `Content-Range`
+        // is measured against the bytes actually being sent (gzip or identity).
+        if (!not_modified) {
+            const auto range_header = request.headers.find("range");
+            if (range_header != request.headers.end()) {
+                ByteRange range;
+                switch (parse_byte_range(range_header->second, body.size(), range)) {
+                    case RangeResult::Ok:
+                        response.status = 206;
+                        response.status_text = status_text_for(206);
+                        response.body = body.substr(range.start, range.length());
+                        response.extra_headers.emplace_back(
+                            "Content-Range", "bytes " + std::to_string(range.start) + "-" +
+                                                 std::to_string(range.end) + "/" +
+                                                 std::to_string(body.size()));
+                        break;
+                    case RangeResult::Unsatisfiable:
+                        response.status = 416;
+                        response.status_text = status_text_for(416);
+                        response.body.clear();
+                        response.extra_headers.emplace_back(
+                            "Content-Range", "bytes */" + std::to_string(body.size()));
+                        break;
+                    case RangeResult::None:
+                        break;  // unsupported form: serve the whole body
+                }
+            }
+        }
+
+        response.extra_headers.emplace_back("Accept-Ranges", "bytes");
         response.extra_headers.emplace_back("ETag", etag);
         response.extra_headers.emplace_back("Cache-Control", "public, max-age=300");
+        if (gzipped) {
+            response.extra_headers.emplace_back("Content-Encoding", "gzip");
+        }
+        // Caches must key on Accept-Encoding whenever a .gz sidecar could apply.
+        response.extra_headers.emplace_back("Vary", "Accept-Encoding");
         if (!last_modified.empty()) {
             response.extra_headers.emplace_back("Last-Modified", last_modified);
         }

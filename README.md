@@ -9,6 +9,8 @@
 - **Real HTTP engine** — bounded worker thread pool, HTTP/1.1 keep-alive with pipelining carry-over, per-socket read/write timeouts, graceful shutdown on `SIGINT`/`SIGTERM`
 - **Hardened parsing** — 64 KiB header cap (`431`), strict `Content-Length` validation, oversized bodies rejected without reading them (`413`), malformed requests → `400`, `405` with `Allow`
 - **Static-file caching** — strong FNV-1a `ETag` + `Last-Modified` + `Cache-Control: public, max-age=300`; conditional `If-None-Match` / `If-Modified-Since` → `304` (APIs stay `no-store`)
+- **Range requests** — `Accept-Ranges: bytes` plus single-range `Range` support (`start-end`, `start-`, `-suffix`) → `206 Partial Content` with `Content-Range`, or `416` when unsatisfiable
+- **Transparent gzip** — serves a pre-built `<file>.gz` sidecar when the client sends `Accept-Encoding: gzip` (honoring `q=0`), with a distinct representation `ETag` and `Vary: Accept-Encoding`; zero runtime CPU, still dependency-free
 - **Traversal defense** — canonical-path containment (symlink escapes and NUL bytes rejected)
 - **Per-IP rate limiting** — token bucket (`--rate-limit`), `429` + `Retry-After`
 - **Live telemetry** — `GET /api/stream` Server-Sent Events pushing metrics snapshots every second; deep metrics with status-class counters and latency `mean`/`max`/`p50`/`p99`
@@ -55,7 +57,7 @@ http://localhost:8080
 | `HEAD` | any GET route | Headers only (body length advertised, no body sent) |
 | `OPTIONS` | any | CORS preflight (`204`) |
 
-Status behaviors: `304` conditional static hits, `400` malformed, `404` unknown path, `405` + `Allow` for unsupported methods, `408` request timeout, `413` oversized body, `429` + `Retry-After` when rate-limited, `431` oversized headers, `503` over the SSE stream cap.
+Status behaviors: `206` + `Content-Range` for satisfiable `Range` requests, `304` conditional static hits, `400` malformed, `404` unknown path, `405` + `Allow` for unsupported methods, `408` request timeout, `413` oversized body, `416` unsatisfiable range, `429` + `Retry-After` when rate-limited, `431` oversized headers, `503` over the SSE stream cap.
 
 ### Mission query parameters
 
@@ -113,7 +115,7 @@ cmake -S . -B build && cmake --build build && ./build/aster_unit_tests
 ctest --test-dir build --output-on-failure
 ```
 
-The smoke suite builds the server, starts it on port `8097` (override with `PORT=`), and exercises: health/mission/palettes/constellation/echo APIs, HEAD/OPTIONS, security headers, keep-alive reuse, oversized-body `413`, header-cap `431`, 50-way concurrency, ETag/`304` conditional GETs, path-traversal probes, per-IP `429` rate limiting, `405` `Allow`, echo JSON validity, SSE streaming, access-log format, and graceful shutdown (including with an open SSE stream) with exit code `0`.
+The smoke suite builds the server, starts it on port `8097` (override with `PORT=`), and exercises: health/mission/palettes/constellation/echo APIs, HEAD/OPTIONS, security headers, keep-alive reuse, oversized-body `413`, header-cap `431`, 50-way concurrency, ETag/`304` conditional GETs, `Range` requests (`206`/`Content-Range`/`416`), gzip sidecar negotiation, path-traversal probes, per-IP `429` rate limiting, `405` `Allow`, echo JSON validity, SSE streaming, access-log format, and graceful shutdown (including with an open SSE stream) with exit code `0`.
 
 CI runs the full suite under g++ and clang++, plus a dedicated ASan+UBSan job.
 

@@ -4,6 +4,7 @@
 
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <map>
 #include <sstream>
 #include <string>
@@ -108,6 +109,135 @@ inline ContentLengthInfo classify_content_length(const std::map<std::string, std
 }
 
 // Keep-alive decision per HTTP/1.x semantics (case-insensitive header value).
+// A single inclusive byte range, as used by `Content-Range`.
+struct ByteRange {
+    std::size_t start = 0;
+    std::size_t end = 0;  // inclusive
+    std::size_t length() const { return end - start + 1; }
+};
+
+// Outcome of parsing a `Range` header against a representation of `size` bytes.
+enum class RangeResult {
+    None,           // absent or not a form we honor -> serve the whole body (200)
+    Ok,             // satisfiable single range -> 206
+    Unsatisfiable,  // syntactically valid but outside the representation -> 416
+};
+
+// Parse a single-range `Range: bytes=...` header per RFC 9110 §14.
+//
+// Supports `start-end`, `start-` (open-ended) and `-suffix` (last N bytes).
+// Multi-range requests are deliberately *not* honored — a server may ignore a
+// Range it does not support, so those fall back to a normal 200 rather than
+// forcing a multipart/byteranges body.
+inline RangeResult parse_byte_range(const std::string& value, std::size_t size, ByteRange& out) {
+    const std::string prefix = "bytes=";
+    if (value.size() <= prefix.size() || value.compare(0, prefix.size(), prefix) != 0) {
+        return RangeResult::None;
+    }
+    std::string spec = value.substr(prefix.size());
+    // Trim surrounding whitespace.
+    while (!spec.empty() && (spec.front() == ' ' || spec.front() == '\t')) spec.erase(spec.begin());
+    while (!spec.empty() && (spec.back() == ' ' || spec.back() == '\t')) spec.pop_back();
+    if (spec.find(',') != std::string::npos) {
+        return RangeResult::None;  // multi-range: ignore, serve the full body
+    }
+    const std::size_t dash = spec.find('-');
+    if (dash == std::string::npos) {
+        return RangeResult::None;
+    }
+
+    const std::string first = spec.substr(0, dash);
+    const std::string last = spec.substr(dash + 1);
+    const auto all_digits = [](const std::string& s) {
+        return !s.empty() && s.find_first_not_of("0123456789") == std::string::npos;
+    };
+
+    // A zero-length representation cannot satisfy any range.
+    if (size == 0) {
+        return RangeResult::Unsatisfiable;
+    }
+
+    if (first.empty()) {
+        // Suffix form: `-N` means the final N bytes.
+        if (!all_digits(last)) {
+            return RangeResult::None;
+        }
+        unsigned long long suffix = std::strtoull(last.c_str(), nullptr, 10);
+        if (suffix == 0) {
+            return RangeResult::Unsatisfiable;
+        }
+        if (suffix > size) {
+            suffix = size;
+        }
+        out.start = size - static_cast<std::size_t>(suffix);
+        out.end = size - 1;
+        return RangeResult::Ok;
+    }
+
+    if (!all_digits(first)) {
+        return RangeResult::None;
+    }
+    const unsigned long long start = std::strtoull(first.c_str(), nullptr, 10);
+    if (start >= size) {
+        return RangeResult::Unsatisfiable;
+    }
+
+    unsigned long long end = size - 1;
+    if (!last.empty()) {
+        if (!all_digits(last)) {
+            return RangeResult::None;
+        }
+        end = std::strtoull(last.c_str(), nullptr, 10);
+        if (end < start) {
+            return RangeResult::Unsatisfiable;
+        }
+        if (end > size - 1) {
+            end = size - 1;
+        }
+    }
+    out.start = static_cast<std::size_t>(start);
+    out.end = static_cast<std::size_t>(end);
+    return RangeResult::Ok;
+}
+
+// Does an `Accept-Encoding` header list gzip with a non-zero quality?
+//
+// Only the gzip entry's own q-value matters here; `gzip;q=0` means "do not
+// send me gzip" and must be honored.
+inline bool accepts_gzip(const std::string& accept_encoding) {
+    const std::string lowered = to_lower(accept_encoding);
+    std::size_t pos = 0;
+    while (pos < lowered.size()) {
+        std::size_t comma = lowered.find(',', pos);
+        if (comma == std::string::npos) {
+            comma = lowered.size();
+        }
+        std::string entry = lowered.substr(pos, comma - pos);
+        pos = comma + 1;
+
+        // Split "<coding>[;q=<value>]" and trim both halves.
+        const std::size_t semi = entry.find(';');
+        std::string coding = entry.substr(0, semi);
+        std::string params = semi == std::string::npos ? std::string{} : entry.substr(semi + 1);
+        const auto trim = [](std::string& s) {
+            while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(s.begin());
+            while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
+        };
+        trim(coding);
+        trim(params);
+        if (coding != "gzip") {
+            continue;
+        }
+
+        const std::size_t q = params.find("q=");
+        if (q == std::string::npos) {
+            return true;  // no q-value means q=1
+        }
+        return std::strtod(params.c_str() + q + 2, nullptr) > 0.0;
+    }
+    return false;
+}
+
 inline bool wants_keep_alive(const std::string& version, const std::string& connection_header) {
     const std::string connection = to_lower(connection_header);
     if (version == "HTTP/1.1") {
@@ -291,12 +421,14 @@ inline std::string status_text_for(int status) {
     switch (status) {
         case 200: return "OK";
         case 204: return "No Content";
+        case 206: return "Partial Content";
         case 304: return "Not Modified";
         case 400: return "Bad Request";
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
         case 408: return "Request Timeout";
         case 413: return "Payload Too Large";
+        case 416: return "Range Not Satisfiable";
         case 429: return "Too Many Requests";
         case 431: return "Request Header Fields Too Large";
         case 500: return "Internal Server Error";

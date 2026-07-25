@@ -15,7 +15,7 @@
 
 namespace aster {
 
-inline constexpr const char* kVersion = "2.0.0";
+inline constexpr const char* kVersion = "2.1.0";
 
 inline std::string to_lower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {

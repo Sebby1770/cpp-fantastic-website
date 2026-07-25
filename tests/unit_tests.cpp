@@ -271,6 +271,64 @@ int main() {
                     metrics.to_json().find("\"/p7\"") != std::string::npos);
     }
 
+    // Range parsing (RFC 9110 §14) over a 100-byte representation.
+    {
+        using aster::ByteRange;
+        using aster::RangeResult;
+        using aster::parse_byte_range;
+        ByteRange r;
+
+        expect_true("range absent-ish header ignored",
+                    parse_byte_range("items=0-5", 100, r) == RangeResult::None);
+        expect_true("range multi-range ignored",
+                    parse_byte_range("bytes=0-9,20-29", 100, r) == RangeResult::None);
+
+        expect_true("range closed ok", parse_byte_range("bytes=0-9", 100, r) == RangeResult::Ok);
+        expect_true("range closed bounds", r.start == 0 && r.end == 9 && r.length() == 10);
+
+        expect_true("range open-ended ok", parse_byte_range("bytes=90-", 100, r) == RangeResult::Ok);
+        expect_true("range open-ended bounds", r.start == 90 && r.end == 99);
+
+        expect_true("range suffix ok", parse_byte_range("bytes=-10", 100, r) == RangeResult::Ok);
+        expect_true("range suffix bounds", r.start == 90 && r.end == 99);
+
+        // A suffix longer than the body clamps to the whole body.
+        expect_true("range suffix clamps", parse_byte_range("bytes=-500", 100, r) == RangeResult::Ok);
+        expect_true("range suffix clamp bounds", r.start == 0 && r.end == 99);
+
+        // An end past the last byte clamps rather than failing.
+        expect_true("range end clamps", parse_byte_range("bytes=95-500", 100, r) == RangeResult::Ok);
+        expect_true("range end clamp bounds", r.start == 95 && r.end == 99);
+
+        expect_true("range start past end unsatisfiable",
+                    parse_byte_range("bytes=100-", 100, r) == RangeResult::Unsatisfiable);
+        expect_true("range inverted unsatisfiable",
+                    parse_byte_range("bytes=50-10", 100, r) == RangeResult::Unsatisfiable);
+        expect_true("range zero suffix unsatisfiable",
+                    parse_byte_range("bytes=-0", 100, r) == RangeResult::Unsatisfiable);
+        expect_true("range on empty body unsatisfiable",
+                    parse_byte_range("bytes=0-5", 0, r) == RangeResult::Unsatisfiable);
+        expect_true("range garbage ignored",
+                    parse_byte_range("bytes=abc-def", 100, r) == RangeResult::None);
+    }
+
+    // Accept-Encoding negotiation for pre-compressed .gz sidecars.
+    {
+        using aster::accepts_gzip;
+        expect_true("gzip plain", accepts_gzip("gzip"));
+        expect_true("gzip in list", accepts_gzip("deflate, gzip, br"));
+        expect_true("gzip with q", accepts_gzip("gzip;q=0.8"));
+        expect_true("gzip uppercase", accepts_gzip("GZIP"));
+        expect_true("gzip spaced list", accepts_gzip("br, gzip ;q=1.0"));
+        expect_true("no gzip", !accepts_gzip("deflate, br"));
+        expect_true("empty header", !accepts_gzip(""));
+        // q=0 explicitly refuses the encoding.
+        expect_true("gzip q=0 refused", !accepts_gzip("gzip;q=0"));
+        expect_true("gzip q=0.0 refused", !accepts_gzip("deflate, gzip;q=0.0"));
+        // "x-gzip" must not be mistaken for "gzip".
+        expect_true("x-gzip is not gzip", !accepts_gzip("x-gzip"));
+    }
+
     // Slow-drip defense: a stalled partial request trips the read deadline
     // (surfaced as Timeout -> 408), while a silent idle connection is a quiet
     // keep-alive close. Small timeouts keep the test fast.
@@ -399,7 +457,7 @@ int main() {
     expect_true("stable_seed distinguishes", aster::stable_seed("orion") != aster::stable_seed("lyra"));
     expect_true("stable_seed empty fnv basis", aster::stable_seed("") == 2166136261u);
 
-    expect_eq("version constant", std::string(aster::kVersion), "2.0.0");
+    expect_eq("version constant", std::string(aster::kVersion), "2.1.0");
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
