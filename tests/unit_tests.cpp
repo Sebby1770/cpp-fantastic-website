@@ -50,7 +50,11 @@ int main() {
     using aster::ParseState;
     using aster::Request;
     using aster::classify_content_length;
+    using aster::current_time_iso;
+    using aster::int_param;
     using aster::json_escape;
+    using aster::parse_query;
+    using aster::stable_seed;
     using aster::try_parse_request;
     using aster::url_decode;
     using aster::wants_keep_alive;
@@ -457,12 +461,24 @@ int main() {
     expect_true("stable_seed distinguishes", aster::stable_seed("orion") != aster::stable_seed("lyra"));
     expect_true("stable_seed empty fnv basis", aster::stable_seed("") == 2166136261u);
 
-    expect_eq("version constant", std::string(aster::kVersion), "2.1.0");
+    expect_eq("version constant", std::string(aster::kVersion), "2.2.0");
+    const auto q = parse_query("seed=alpha&min=1&max=10");
+    expect_eq("query seed", q.at("seed"), "alpha");
+    expect_eq("query min", q.at("min"), "1");
+    expect_true("int clamp high", int_param(q, "max", 0, 0, 5) == 5);
+    expect_true("int fallback", int_param(q, "missing", 7, 0, 100) == 7);
+    expect_true("stable seed deterministic",
+                stable_seed("aster") == stable_seed("aster"));
+    expect_true("stable seed differs",
+                stable_seed("a") != stable_seed("b"));
+    const std::string iso = current_time_iso();
+    expect_true("iso ends with Z", !iso.empty() && iso.back() == 'Z');
+    expect_true("iso has T", iso.find('T') != std::string::npos);
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return 1;
     }
-    std::cout << "All unit tests passed\n";
+    std::cout << "all unit tests passed\n";
     return 0;
 }

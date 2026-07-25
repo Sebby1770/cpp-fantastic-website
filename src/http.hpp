@@ -27,6 +27,9 @@ inline constexpr std::chrono::milliseconds kIdleTimeoutDefault{5000};
 // (which a slow-drip client resets with every byte), this bounds the whole
 // read, so a slowloris-style client cannot pin a pool worker indefinitely.
 inline constexpr std::chrono::milliseconds kRequestDeadlineDefault{10000};
+// kVersion now lives in util.hpp (included above) so every module shares one
+// definition; the 1.2 line kept its own copy here.
+
 
 struct Request {
     std::string method;

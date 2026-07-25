@@ -57,6 +57,28 @@ const elements = {
 };
 
 const ctx = elements.canvas.getContext("2d");
+
+function readUrlState() {
+  const params = new URLSearchParams(window.location.search);
+  if (params.has("seed") && elements.seed) elements.seed.value = params.get("seed");
+  if (params.has("mode")) state.mode = params.get("mode");
+  if (params.has("intensity") && elements.intensity) elements.intensity.value = params.get("intensity");
+  if (params.has("tempo") && elements.tempo) elements.tempo.value = params.get("tempo");
+  if (params.has("palette")) state.paletteId = params.get("palette");
+}
+
+function writeUrlState() {
+  const params = new URLSearchParams({
+    seed: elements.seed?.value || "sebby",
+    mode: state.mode,
+    intensity: elements.intensity?.value || "68",
+    tempo: elements.tempo?.value || "42",
+  });
+  if (state.paletteId) params.set("palette", state.paletteId);
+  const next = `${window.location.pathname}?${params.toString()}`;
+  window.history.replaceState({}, "", next);
+}
+
 const seedWords = ["kinetic", "harbor", "cedar", "lumen", "summit", "signal", "maker", "atlas", "bright", "orbit"];
 
 function resizeCanvas() {
@@ -85,6 +107,7 @@ function formatUptime(seconds) {
 }
 
 function apiUrl() {
+  writeUrlState();
   const params = new URLSearchParams({
     seed: elements.seed.value || "sebby",
     mode: state.mode,
@@ -883,6 +906,8 @@ resizeCanvas();
 bindEvents();
 bindShortcuts();
 checkHealth();
+setInterval(checkHealth, 5000);
+if (typeof loadMetrics === "function") { loadMetrics(); setInterval(loadMetrics, 2000); }
 loadPalettes();
 loadMission();
 loadMetrics();

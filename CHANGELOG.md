@@ -3,6 +3,22 @@
 All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.2.0] - 2026-07-25
+
+Unifies the 2.x engine line with the 1.2 API additions that landed on `main`
+in parallel — both feature sets ship together.
+
+### Added
+
+- Carried over from 1.2: `GET /api/version`, `/api/time`, `/api/random`,
+  `/api/status`, and a JSON `404` body for unknown `/api/*` paths, now served
+  by the 2.x worker-pool dispatch. `/api/version` lists `/api/stream` too.
+
+### Changed
+
+- Version **2.2.0**; the single `aster::kVersion` constant is reported by
+  `/api/health`, `/api/version`, `/api/status`, `/api/mission`, and the banner.
+
 ## [2.1.0] - 2026-07-24
 
 ### Added
@@ -75,3 +91,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - Initial release: C++17 POSIX-socket HTTP server serving a static site with mission/health JSON APIs
+
+## [1.2.0] - 2026-07-24
+
+Developed in parallel with the 2.x line; merged in 2.2.0.
+
+### Added
+- `GET /api/version` — service metadata and endpoint list
+- `GET /api/time` — ISO-8601 UTC and unix timestamp
+- `GET /api/random` — deterministic seeded integer (`seed`, `min`, `max`)
+- `GET /api/status` — richer health (public_dir, port, uptime, requests)
+- JSON 404 body for unknown `/api/*` paths

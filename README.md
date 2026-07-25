@@ -48,6 +48,10 @@ http://localhost:8080
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/api/health` | Liveness: `status`, `version`, `uptime_seconds`, `request_count` |
+| `GET` | `/api/version` | Service metadata + endpoint list |
+| `GET` | `/api/time` | ISO-8601 UTC + unix timestamp |
+| `GET` | `/api/random` | Deterministic seeded random int (`seed`, `min`, `max`) |
+| `GET` | `/api/status` | Richer health snapshot (`public_dir`, `port`, `uptime`, `request_count`) |
 | `GET` | `/api/mission` | Mission packet (seed, mode, intensity, tempo, optional `palette`) |
 | `GET` | `/api/palettes` | Named color palettes |
 | `GET` | `/api/constellation` | Star points for the canvas (`seed`, `points`) |
@@ -80,7 +84,7 @@ Status behaviors: `206` + `Content-Range` for satisfiable `Range` requests, `304
 
 ```bash
 curl -s http://localhost:8080/api/health
-# {"status":"ok","service":"AsterForge","language":"C++17","version":"2.0.0",...}
+# {"status":"ok","service":"AsterForge","language":"C++17","version":"2.2.0",...}
 
 curl -s "http://localhost:8080/api/constellation?seed=7&points=12"
 curl -s -X POST http://localhost:8080/api/echo -H 'Content-Type: application/json' -d '{"ping":1}'
@@ -161,4 +165,4 @@ Client ──► accept (poll, shutdown-aware) ──► ThreadPool worker      
               │                        └── send_response + access log
 ```
 
-Version: **2.0.0**
+Version: **2.2.0**
