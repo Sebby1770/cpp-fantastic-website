@@ -1,6 +1,7 @@
 #include "http.hpp"
 #include "log.hpp"
 #include "metrics.hpp"
+#include "mission.hpp"
 #include "rate_limiter.hpp"
 #include "server.hpp"
 #include "stream.hpp"
@@ -462,7 +463,52 @@ int main() {
     expect_true("stable_seed distinguishes", aster::stable_seed("orion") != aster::stable_seed("lyra"));
     expect_true("stable_seed empty fnv basis", aster::stable_seed("") == 2166136261u);
 
-    expect_eq("version constant", std::string(aster::kVersion), "2.2.0");
+    expect_eq("version constant", std::string(aster::kVersion), "2.3.0");
+
+    auto count_key = [](const std::string& hay, const std::string& needle) {
+        int n = 0;
+        for (std::size_t at = 0; (at = hay.find(needle, at)) != std::string::npos;
+             at += needle.size()) {
+            ++n;
+        }
+        return n;
+    };
+
+    {
+        const std::map<std::string, std::string> sky_query{{"seed", "orion"}, {"layers", "4"}};
+        const std::string sky1 = aster::build_sky_json(sky_query);
+        const std::string sky2 = aster::build_sky_json(sky_query);
+        expect_eq("sky deterministic", sky1, sky2);
+        expect_true("sky has layers", sky1.find("\"layers\"") != std::string::npos);
+        expect_true("sky has haze", sky1.find("\"haze\"") != std::string::npos);
+        expect_true("sky has dust", sky1.find("\"dust\"") != std::string::npos);
+        expect_true("sky has aurora", sky1.find("\"aurora\"") != std::string::npos);
+        expect_true("sky version", sky1.find("\"version\":\"2.3.0\"") != std::string::npos);
+        expect_true("sky four layers", count_key(sky1, "\"sat\":") == 4);
+        const std::string sky_other = aster::build_sky_json({{"seed", "lyra"}, {"layers", "4"}});
+        expect_true("sky seed distinguishes", sky1 != sky_other);
+        const std::string sky_clamped = aster::build_sky_json({{"seed", "orion"}, {"layers", "99"}});
+        expect_true("sky layers clamp high", count_key(sky_clamped, "\"sat\":") == 8);
+        const std::string sky_low = aster::build_sky_json({{"seed", "orion"}, {"layers", "1"}});
+        expect_true("sky layers clamp low", count_key(sky_low, "\"sat\":") == 2);
+    }
+
+    {
+        const std::map<std::string, std::string> orbit_query{{"seed", "42"}, {"planets", "6"}};
+        const std::string orbit1 = aster::build_orbit_json(orbit_query);
+        const std::string orbit2 = aster::build_orbit_json(orbit_query);
+        expect_eq("orbit deterministic", orbit1, orbit2);
+        expect_true("orbit has planets", orbit1.find("\"planets\"") != std::string::npos);
+        expect_true("orbit has star", orbit1.find("\"star\"") != std::string::npos);
+        expect_true("orbit version", orbit1.find("\"version\":\"2.3.0\"") != std::string::npos);
+        expect_true("orbit six planets", count_key(orbit1, "\"name\":") == 6);
+        const std::string orbit_other = aster::build_orbit_json({{"seed", "43"}, {"planets", "6"}});
+        expect_true("orbit seed distinguishes", orbit1 != orbit_other);
+        const std::string orbit_high = aster::build_orbit_json({{"seed", "42"}, {"planets", "99"}});
+        expect_true("orbit planets clamp high", count_key(orbit_high, "\"name\":") == 10);
+        const std::string orbit_low = aster::build_orbit_json({{"seed", "42"}, {"planets", "1"}});
+        expect_true("orbit planets clamp low", count_key(orbit_low, "\"name\":") == 3);
+    }
 
     // Access log: both formats, and the sub-millisecond precision that an
     // integer-millisecond log would report as a useless "0" for most handlers.

@@ -1,8 +1,8 @@
 # C++ Fantastic Website
 
-**AsterForge** is a polished interactive web app served by a native **C++17** HTTP server. The backend generates live mission data, color palettes, constellation geometry, and streaming request telemetry — with zero runtime framework dependencies (POSIX sockets only).
+**AsterForge** is a polished interactive web app served by a native **C++17** HTTP server. The backend generates live mission data, color palettes, constellation geometry, nebula skyboxes, orbital systems, and streaming request telemetry — with zero runtime framework dependencies (POSIX sockets only).
 
-**Version: 2.0.0**
+**Version: 2.3.0**
 
 ## Highlights
 
@@ -15,7 +15,8 @@
 - **Per-IP rate limiting** — token bucket (`--rate-limit`), `429` + `Retry-After`
 - **Live telemetry** — `GET /api/stream` Server-Sent Events pushing metrics snapshots every second; deep metrics with status-class counters and latency `mean`/`max`/`p50`/`p99`
 - **Structured access log** — JSON by default (`--log-format json|text`), one object per request with time, IP, method, path, status, bytes and sub-millisecond latency; mutex-serialized and flushed per line so `tail -f` works on a live server
-- **Frontend workspace** — live telemetry dashboard fed by SSE, nebula layers, shooting stars, warp mode, keyboard shortcuts, `prefers-reduced-motion` support, mobile layout
+- **Frontend workspace** — living orrery (orbiting planets, nebula skybox, aurora, dust) plus constellation, warp, SSE telemetry, keyboard shortcuts (`o` / `w` / `?`), `prefers-reduced-motion` support, mobile layout
+- **GitHub Pages demo** — `public/` is published statically; in-browser generators keep sky / orbit / constellation interactive when the C++ APIs are absent
 - **Quality gates** — 100+ unit tests, end-to-end smoke suite, CI matrix (g++/clang++) plus an ASan+UBSan job
 
 ## Run Locally
@@ -56,6 +57,8 @@ http://localhost:8080
 | `GET` | `/api/mission` | Mission packet (seed, mode, intensity, tempo, optional `palette`) |
 | `GET` | `/api/palettes` | Named color palettes |
 | `GET` | `/api/constellation` | Star points for the canvas (`seed`, `points`) |
+| `GET` | `/api/sky` | Deterministic nebula / skybox (`seed` string, `layers` 2–8) |
+| `GET` | `/api/orbit` | Deterministic miniature solar system (`seed` int, `planets` 3–10) |
 | `GET` | `/api/metrics` | `total_requests`, `by_path`, `uptime_seconds`, status classes (`2xx`–`5xx`), `latency_ms` (`count`/`mean`/`max`/`p50`/`p99`) |
 | `GET` | `/api/stream` | Server-Sent Events telemetry (`event: telemetry` every 1 s; max 32 concurrent streams, over cap → `503`) |
 | `POST` | `/api/echo` | Echo JSON body back (demo / Content-Length parsing) |
@@ -81,13 +84,29 @@ Status behaviors: `206` + `Content-Range` for satisfiable `Range` requests, `304
 | `seed` | `42` | Integer seed |
 | `points` | `24` | 4–128 star count |
 
+### Sky query parameters
+
+| Param | Default | Notes |
+|-------|---------|-------|
+| `seed` | `sebby` | String seed (`stable_seed` → `mt19937`) |
+| `layers` | `4` | 2–8 nebula layers |
+
+### Orbit query parameters
+
+| Param | Default | Notes |
+|-------|---------|-------|
+| `seed` | `42` | Integer seed |
+| `planets` | `6` | 3–10 planet count |
+
 ### Example requests
 
 ```bash
 curl -s http://localhost:8080/api/health
-# {"status":"ok","service":"AsterForge","language":"C++17","version":"2.2.0",...}
+# {"status":"ok","service":"AsterForge","language":"C++17","version":"2.3.0",...}
 
 curl -s "http://localhost:8080/api/constellation?seed=7&points=12"
+curl -s "http://localhost:8080/api/sky?seed=orion&layers=5"
+curl -s "http://localhost:8080/api/orbit?seed=42&planets=6"
 curl -s -X POST http://localhost:8080/api/echo -H 'Content-Type: application/json' -d '{"ping":1}'
 
 # Live telemetry stream (SSE)
@@ -105,7 +124,9 @@ All responses include:
 
 ## Frontend
 
-The constellation workspace in `public/` consumes the SSE stream for a live telemetry dashboard (request totals, status classes, latency percentiles) and renders nebula layers, shooting stars, and a warp mode on canvas. Keyboard shortcuts are listed in-app (`?`), warp toggles with `w`, and all ambient animation honors `prefers-reduced-motion`.
+The orrery workspace in `public/` consumes the SSE stream for a live telemetry dashboard (request totals, status classes, latency percentiles) and renders a nebula skybox, dust, an aurora ribbon, a glowing star with revolving planets and moons, constellation links in the background, shooting stars, and warp mode. Keyboard shortcuts are listed in-app (`?`); warp toggles with `w`, the orbital system with `o`. Ambient animation honors `prefers-reduced-motion` (orbital angles freeze).
+
+When `/api/sky`, `/api/orbit`, `/api/constellation`, or `/api/mission` are missing (GitHub Pages, offline), matching in-browser generators produce the same JSON shapes so the demo stays interactive.
 
 ## Tests
 
@@ -120,7 +141,7 @@ cmake -S . -B build && cmake --build build && ./build/aster_unit_tests
 ctest --test-dir build --output-on-failure
 ```
 
-The smoke suite builds the server, starts it on port `8097` (override with `PORT=`), and exercises: health/mission/palettes/constellation/echo APIs, HEAD/OPTIONS, security headers, keep-alive reuse, oversized-body `413`, header-cap `431`, 50-way concurrency, ETag/`304` conditional GETs, `Range` requests (`206`/`Content-Range`/`416`), gzip sidecar negotiation, path-traversal probes, per-IP `429` rate limiting, `405` `Allow`, echo JSON validity, SSE streaming, access-log format (JSON parsed and field-checked, plus `--log-format text`), and graceful shutdown (including with an open SSE stream) with exit code `0`.
+The smoke suite builds the server, starts it on port `8097` (override with `PORT=`), and exercises: health/mission/palettes/constellation/sky/orbit/echo APIs, HEAD/OPTIONS, security headers, keep-alive reuse, oversized-body `413`, header-cap `431`, 50-way concurrency, ETag/`304` conditional GETs, `Range` requests (`206`/`Content-Range`/`416`), gzip sidecar negotiation, path-traversal probes, per-IP `429` rate limiting, `405` `Allow`, echo JSON validity, SSE streaming, access-log format (JSON parsed and field-checked, plus `--log-format text`), and graceful shutdown (including with an open SSE stream) with exit code `0`.
 
 CI runs the full suite under g++ and clang++, plus a dedicated ASan+UBSan job.
 
@@ -138,7 +159,7 @@ CI runs the full suite under g++ and clang++, plus a dedicated ASan+UBSan job.
 |   |-- http.hpp            # Request / Response / parse / send / limits
 |   |-- log.hpp             # Mutex-serialized access log (JSON / text)
 |   |-- metrics.hpp         # Thread-safe counters + latency ring
-|   |-- mission.hpp         # Mission, palettes, constellation JSON
+|   |-- mission.hpp         # Mission, palettes, constellation, sky, orbit JSON
 |   |-- rate_limiter.hpp    # Per-IP token bucket
 |   |-- server.hpp          # Server class, routing, static cache, CLI
 |   |-- stream.hpp          # SSE hub + telemetry stream threads
@@ -147,8 +168,19 @@ CI runs the full suite under g++ and clang++, plus a dedicated ASan+UBSan job.
 |-- tests/
 |   |-- smoke.sh
 |   `-- unit_tests.cpp
-`-- .github/workflows/ci.yml
+`-- .github/workflows/
+    |-- ci.yml
+    `-- pages.yml           # Publishes public/ to GitHub Pages
 ```
+
+## GitHub Pages
+
+A static copy of `public/` is published by `.github/workflows/pages.yml`
+(`peaceiris/actions-gh-pages@v4`, `publish_dir: ./public`) on pushes to `main`.
+Asset paths in `index.html` are relative (`./styles.css`, `./app.js`) so they
+work both at the C++ server root and at a project Pages URL such as
+`/cpp-fantastic-website/`. Without the native binary the UI falls back to
+in-browser generators for sky, orbit, constellation, palettes, and mission.
 
 ## Architecture
 
@@ -166,4 +198,4 @@ Client ──► accept (poll, shutdown-aware) ──► ThreadPool worker      
               │                        └── send_response + access log
 ```
 
-Version: **2.2.0**
+Version: **2.3.0**

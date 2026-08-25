@@ -3,6 +3,35 @@
 All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.3.0] - 2026-08-25
+
+Orbital skybox: a living orrery on the stage, two new deterministic JSON APIs,
+and a static GitHub Pages demo that stays interactive without the C++ binary.
+
+### Added
+
+- `GET /api/sky` — nebula / skybox packet from a string `seed` (default `sebby`)
+  and `layers` (2–8, default 4): haze, radial-gradient layers, dust count, and
+  an optional aurora ribbon. Seeded with `stable_seed` + `mt19937`.
+- `GET /api/orbit` — tiny solar system from an integer `seed` (default 42) and
+  `planets` (3–10, default 6): a glowing star plus named planets with orbit,
+  period, phase, moons, and rings. Deterministic shuffle of a mythic name list.
+- Frontend orrery: nebula layers, dust motes, aurora, revolving planets with
+  moons, constellation in the background, Warp / Orbit / Nebula toggles.
+  Keyboard `o` toggles the orbital system; `w` and `?` are unchanged.
+  `prefers-reduced-motion` freezes orbital angles.
+- Client-side sky / orbit / constellation / mission generators so a static
+  GitHub Pages copy of `public/` still runs when `/api/*` is missing.
+- `.github/workflows/pages.yml` publishes `public/` with
+  `peaceiris/actions-gh-pages@v4`.
+
+### Changed
+
+- Version **2.3.0**; `aster::kVersion` and CMake `VERSION` bumped together.
+- `/api/version` endpoint list includes `/api/sky` and `/api/orbit`.
+- `index.html` uses relative `./styles.css` and `./app.js` so Pages project
+  URLs and the C++ static server both resolve assets.
+
 ## [2.2.0] - 2026-07-25
 
 Unifies the 2.x engine line with the 1.2 API additions that landed on `main`

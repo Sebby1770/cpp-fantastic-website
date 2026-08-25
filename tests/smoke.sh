@@ -41,6 +41,25 @@ echo "== constellation =="
 curl -fsS "$BASE/api/constellation?seed=7&points=12" | grep -q '"stars"'
 curl -fsS "$BASE/api/constellation?seed=7&points=12" | grep -q '"links"'
 
+echo "== sky =="
+curl -fsS "$BASE/api/sky?seed=smoke&layers=4" | grep -q '"layers"'
+curl -fsS "$BASE/api/sky?seed=smoke&layers=4" | grep -q '"aurora"'
+curl -fsS "$BASE/api/version" | grep -q '/api/sky'
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/sky")
+[ "$CODE" = "405" ]
+
+echo "== orbit =="
+curl -fsS "$BASE/api/orbit?seed=7&planets=5" | grep -q '"planets"'
+curl -fsS "$BASE/api/orbit?seed=7&planets=5" | grep -q '"star"'
+curl -fsS "$BASE/api/version" | grep -q '/api/orbit'
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/orbit")
+[ "$CODE" = "405" ]
+
+echo "== unknown api 404 =="
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/does-not-exist")
+[ "$CODE" = "404" ]
+curl -s "$BASE/api/does-not-exist" | grep -q '"error":"not_found"'
+
 echo "== metrics =="
 curl -fsS "$BASE/api/metrics" | grep -q '"total_requests"'
 curl -fsS "$BASE/api/metrics" | grep -q '"by_path"'
@@ -183,6 +202,11 @@ grep -q 'telemetryPanel' "$ROOT_DIR/public/index.html"
 grep -q 'sparkCanvas' "$ROOT_DIR/public/index.html"
 grep -q 'shortcutOverlay' "$ROOT_DIR/public/index.html"
 grep -q 'warpButton' "$ROOT_DIR/public/index.html"
+grep -q 'orbitToggle' "$ROOT_DIR/public/index.html"
+grep -q 'nebulaToggle' "$ROOT_DIR/public/index.html"
+grep -q 'generateSky' "$ROOT_DIR/public/app.js"
+grep -q 'generateOrbit' "$ROOT_DIR/public/app.js"
+grep -q 'generateConstellation' "$ROOT_DIR/public/app.js"
 grep -q 'prefers-reduced-motion' "$ROOT_DIR/public/styles.css"
 grep -q 'prefers-reduced-motion' "$ROOT_DIR/public/app.js"
 

@@ -1,4 +1,19 @@
+const CLIENT_VERSION = "2.3.0";
 const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+
+const FALLBACK_PALETTES = [
+  { id: "ember", name: "Ember Desk", colors: ["#171717", "#f7f2e8", "#247c76", "#d85d4c", "#c79a34", "#6e62a6"] },
+  { id: "harbor", name: "Harbor Studio", colors: ["#222226", "#f4efe3", "#2f6f9f", "#cf5b39", "#8fa34a", "#7b4f87"] },
+  { id: "aurora", name: "Aurora Field", colors: ["#161616", "#fbfaf6", "#18706a", "#b94f5f", "#d0a13f", "#476b9b"] },
+  { id: "midnight", name: "Midnight Forge", colors: ["#0f1115", "#e8eef7", "#3d7ea6", "#e07a5f", "#f2cc8f", "#81b29a"] },
+  { id: "orchid", name: "Orchid Signal", colors: ["#1a1423", "#f6f0ff", "#7b5ea7", "#e07a9a", "#f4c95f", "#4ecdc4"] }
+];
+
+const PLANET_NAMES = [
+  "Aether", "Nyx", "Helios", "Selene", "Atlas", "Lyra", "Vega", "Rigel",
+  "Electra", "Thalassa", "Hyperion", "Andromeda", "Cassiopeia", "Orion",
+  "Perseus", "Io"
+];
 
 const state = {
   mode: "pulse",
@@ -7,6 +22,10 @@ const state = {
   palettes: [],
   constellation: null,
   constellationSeed: Math.floor(Math.random() * 10000),
+  sky: null,
+  orbit: null,
+  dust: [],
+  usingFallback: false,
   pointer: { x: 0.5, y: 0.5, active: false },
   time: 0,
   warp: false,
@@ -35,6 +54,8 @@ const elements = {
   seed: document.querySelector("#seedInput"),
   grid: document.querySelector("#gridToggle"),
   trails: document.querySelector("#trailToggle"),
+  orbitToggle: document.querySelector("#orbitToggle"),
+  nebulaToggle: document.querySelector("#nebulaToggle"),
   generate: document.querySelector("#generateButton"),
   randomizeSeed: document.querySelector("#randomizeSeed"),
   reseedConstellation: document.querySelector("#reseedConstellation"),
@@ -80,6 +101,225 @@ function writeUrlState() {
 }
 
 const seedWords = ["kinetic", "harbor", "cedar", "lumen", "summit", "signal", "maker", "atlas", "bright", "orbit"];
+
+function nebulaEnabled() {
+  return !elements.nebulaToggle || elements.nebulaToggle.checked;
+}
+
+function orbitEnabled() {
+  return !elements.orbitToggle || elements.orbitToggle.checked;
+}
+
+function stableSeed(value) {
+  let hash = 2166136261;
+  const text = String(value);
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function makeRng(seed) {
+  let a = seed >>> 0;
+  return function next() {
+    a |= 0;
+    a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+function hslToHex(h, s, l) {
+  const sat = Math.max(0, Math.min(1, s));
+  const light = Math.max(0, Math.min(1, l));
+  const a = sat * Math.min(light, 1 - light);
+  const f = (n) => {
+    const k = (n + h / 30) % 12;
+    const color = light - a * Math.max(Math.min(k - 3, 9 - k, 1), -1);
+    return Math.round(255 * color).toString(16).padStart(2, "0");
+  };
+  return `#${f(0)}${f(8)}${f(4)}`;
+}
+
+function shuffleInPlace(list, rng) {
+  for (let i = list.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(rng() * (i + 1));
+    const swap = list[i];
+    list[i] = list[j];
+    list[j] = swap;
+  }
+  return list;
+}
+
+function generateSky(seed, layers) {
+  const seedText = seed || "sebby";
+  const count = Math.max(2, Math.min(8, layers || 4));
+  const rng = makeRng(stableSeed(`${seedText}:sky:${count}`));
+  const packLayers = [];
+  for (let i = 0; i < count; i += 1) {
+    packLayers.push({
+      hue: rng() * 360,
+      sat: 28 + rng() * 64,
+      light: 18 + rng() * 54,
+      x: 0.08 + rng() * 0.84,
+      y: 0.08 + rng() * 0.84,
+      radius: 0.16 + rng() * 0.62,
+      alpha: 0.12 + rng() * 0.5
+    });
+  }
+  return {
+    seed: seedText,
+    version: CLIENT_VERSION,
+    haze: rng(),
+    layers: packLayers,
+    dust: 20 + Math.floor(rng() * 201),
+    aurora: {
+      enabled: rng() > 0.32,
+      hue: rng() * 360,
+      amplitude: rng(),
+      speed: rng()
+    }
+  };
+}
+
+function generateOrbit(seed, planets) {
+  const s = Math.max(0, Math.min(1000000, Number(seed) || 42));
+  const count = Math.max(3, Math.min(10, planets || 6));
+  const rng = makeRng((Math.imul(s, 2654435761) + 1337) >>> 0);
+  const names = shuffleInPlace(PLANET_NAMES.slice(), rng);
+  const span = 0.80;
+  const gap = count > 1 ? span / (count - 1) : 0;
+  const starHue = 32 + rng() * 28;
+  const list = [];
+  for (let i = 0; i < count; i += 1) {
+    const jitter = (rng() - 0.5) * gap * 0.22;
+    const orbit = Math.max(0.12, Math.min(0.92, 0.12 + gap * i + jitter));
+    list.push({
+      name: names[i % names.length],
+      color: hslToHex(rng() * 360, 0.42 + rng() * 0.45, 0.38 + rng() * 0.28),
+      orbit,
+      radius: 0.01 + rng() * 0.04,
+      period: Math.max(4, Math.min(40, 4 + 36 * ((orbit - 0.12) / span) + (rng() - 0.5) * 3)),
+      phase: rng() * 6.2832,
+      moons: Math.floor(rng() * 4),
+      ring: rng() < 0.22
+    });
+  }
+  return {
+    seed: s,
+    version: CLIENT_VERSION,
+    star: {
+      color: hslToHex(starHue, 0.82 + rng() * 0.16, 0.62 + rng() * 0.12),
+      radius: 0.07 + rng() * 0.03,
+      flare: 0.18 + rng() * 0.62
+    },
+    planets: list
+  };
+}
+
+function generateConstellation(seed, points) {
+  const s = Math.max(0, Math.min(1000000, Number(seed) || 42));
+  const n = Math.max(4, Math.min(128, points || 24));
+  const rng = makeRng((Math.imul(s, 2654435761) + 97) >>> 0);
+  const stars = [];
+  const links = [];
+  for (let i = 0; i < n; i += 1) {
+    stars.push({
+      x: 0.05 + rng() * 0.9,
+      y: 0.05 + rng() * 0.9,
+      size: 1.5 + rng() * 4,
+      brightness: 0.35 + rng() * 0.65
+    });
+  }
+  for (let i = 0; i < n - 1; i += 1) {
+    const jump = 1 + Math.floor(rng() * Math.min(4, n - 1));
+    links.push([i, (i + jump) % n]);
+  }
+  return { seed: s, points: n, stars, links };
+}
+
+function generateMission() {
+  const seed = elements.seed?.value || "sebby";
+  const mode = state.mode || "pulse";
+  const intensity = Number(elements.intensity?.value) || 68;
+  const tempo = Number(elements.tempo?.value) || 42;
+  const rng = makeRng(stableSeed(`${seed}:${mode}:${intensity}:${tempo}:${state.paletteId || ""}`));
+  const palettes = state.palettes.length ? state.palettes : FALLBACK_PALETTES;
+  let palette = palettes[stableSeed(mode) % palettes.length];
+  if (state.paletteId) {
+    const found = palettes.find((item) => item.id === state.paletteId);
+    if (found) palette = found;
+  }
+  const pick = (values) => values[Math.floor(rng() * values.length)];
+  const metric = (base) => Math.max(1, Math.min(99, base + Math.floor(rng() * 24) - 9));
+  const prefixes = ["Aurora", "Vector", "Signal", "Lumen", "Civic", "Keystone", "Nova", "Harbor"];
+  const nouns = ["Circuit", "Studio", "Atlas", "Engine", "Desk", "Forge", "Field", "Pulse"];
+  const taglines = [
+    "Turn rough sparks into a focused launch board.",
+    "Shape a crisp interface around messy momentum.",
+    "Make the next move visible, measurable, and satisfying.",
+    "Blend strategy, rhythm, and craft into one working surface."
+  ];
+  const priorities = shuffleInPlace([
+    "Prototype the most useful interaction first",
+    "Name the one metric that proves traction",
+    "Polish the path from idea to visible result",
+    "Keep the dashboard dense, calm, and quick to scan",
+    "Ship a tiny loop that feels complete",
+    "Use motion only where it clarifies state"
+  ], rng).slice(0, 4);
+  const stages = ["Map", "Focus", "Build", "Tune", "Launch", "Learn"];
+  const nodeCount = 18 + Math.floor(intensity / 8);
+  const nodes = [];
+  const links = [];
+  for (let i = 0; i < nodeCount; i += 1) {
+    nodes.push({
+      x: 0.08 + rng() * 0.84,
+      y: 0.08 + rng() * 0.84,
+      size: 3 + Math.floor(rng() * 8),
+      energy: 28 + Math.floor(rng() * 72)
+    });
+  }
+  for (let i = 0; i < nodeCount - 1; i += 1) {
+    links.push([i, (i + 1 + Math.floor(rng() * 4)) % nodeCount]);
+  }
+  return {
+    app: "AsterForge",
+    version: CLIENT_VERSION,
+    seed,
+    mode,
+    intensity,
+    tempo,
+    updatedAt: new Date().toISOString(),
+    missionName: `${pick(prefixes)} ${pick(nouns)}`,
+    tagline: pick(taglines),
+    paletteId: palette.id,
+    paletteName: palette.name,
+    metrics: [
+      { label: "Momentum", value: metric(58 + Math.floor(intensity / 3)), unit: "%" },
+      { label: "Clarity", value: metric(54 + Math.floor(tempo / 4)), unit: "%" },
+      { label: "Delight", value: metric(62 + Math.floor((intensity + tempo) / 8)), unit: "%" },
+      { label: "Risk", value: metric(34 + Math.floor((100 - tempo) / 5)), unit: "%" }
+    ],
+    priorities,
+    waypoints: stages.map((label, index) => ({
+      label,
+      minutes: 12 + index * 7 + Math.floor(tempo / 9),
+      score: metric(48 + index * 6 + Math.floor(intensity / 8))
+    })),
+    palette: palette.colors.slice(),
+    nodes,
+    links
+  };
+}
+
+async function fetchJson(url) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`${url} failed`);
+  return response.json();
+}
 
 function resizeCanvas() {
   const rect = elements.canvas.getBoundingClientRect();
@@ -136,11 +376,14 @@ async function checkHealth() {
       elements.requestCount.textContent = String(data.request_count ?? "—");
     }
     if (elements.serverVersion) {
-      elements.serverVersion.textContent = data.version || "—";
+      elements.serverVersion.textContent = data.version || CLIENT_VERSION;
     }
   } catch {
     elements.serverStatus.textContent = "offline";
     elements.serverStatus.classList.remove("online", "live");
+    if (elements.serverVersion && (elements.serverVersion.textContent === "—" || state.usingFallback)) {
+      elements.serverVersion.textContent = `${CLIENT_VERSION}*`;
+    }
   }
 }
 
@@ -167,7 +410,9 @@ async function loadMetrics() {
     const data = await response.json();
     elements.serverMetrics.innerHTML = metricsMarkup(data);
   } catch {
-    elements.serverMetrics.textContent = "Metrics unavailable";
+    elements.serverMetrics.textContent = state.usingFallback
+      ? "Static demo — C++ APIs unavailable, local sky/orbit generators are running."
+      : "Metrics unavailable";
   }
 }
 
@@ -215,9 +460,11 @@ function connectTelemetry() {
     applyTelemetry(data);
   });
   source.addEventListener("error", () => {
-    elements.serverStatus.textContent = "reconnecting";
+    elements.serverStatus.textContent = state.usingFallback ? "offline" : "reconnecting";
     elements.serverStatus.classList.remove("online", "live");
-    elements.serverStatus.classList.add("reconnecting");
+    if (!state.usingFallback) {
+      elements.serverStatus.classList.add("reconnecting");
+    }
     startPolling();
   });
 }
@@ -332,20 +579,19 @@ function drawSparkline() {
 }
 
 /* ---------------------------------------------------------------------------
- * Mission / palettes / constellation data
+ * Mission / palettes / constellation / sky / orbit
  * ------------------------------------------------------------------------- */
 
 async function loadPalettes() {
   if (!elements.palettePicker) return;
   try {
-    const response = await fetch("/api/palettes");
-    if (!response.ok) throw new Error("palettes failed");
-    const data = await response.json();
-    state.palettes = data.palettes || [];
-    renderPalettePicker();
+    const data = await fetchJson("/api/palettes");
+    state.palettes = data.palettes || FALLBACK_PALETTES;
   } catch (error) {
     console.warn("palettes endpoint unavailable", error);
+    state.palettes = FALLBACK_PALETTES;
   }
+  renderPalettePicker();
 }
 
 function renderPalettePicker() {
@@ -372,41 +618,87 @@ function renderPalettePicker() {
   });
 }
 
+function layerCountFromIntensity() {
+  return Math.max(2, Math.min(8, 2 + Math.floor(Number(elements.intensity?.value || 68) / 20)));
+}
+
+function planetCountFromIntensity() {
+  return Math.max(3, Math.min(10, 3 + Math.floor(Number(elements.intensity?.value || 68) / 16)));
+}
+
+function rebuildDust() {
+  const sky = state.sky;
+  const n = sky ? Math.max(20, Math.min(220, Number(sky.dust) || 80)) : 0;
+  const rng = makeRng(stableSeed(`${(sky && sky.seed) || "dust"}:dust:${n}`));
+  state.dust = Array.from({ length: n }, () => ({
+    x: rng(),
+    y: rng(),
+    z: 0.28 + rng() * 0.72,
+    tw: rng() * Math.PI * 2
+  }));
+}
+
 async function loadConstellation() {
+  const points = 20 + Math.floor(Number(elements.intensity.value) / 5);
   try {
-    const points = 20 + Math.floor(Number(elements.intensity.value) / 5);
-    const response = await fetch(`/api/constellation?seed=${state.constellationSeed}&points=${points}`);
-    if (!response.ok) throw new Error("constellation failed");
-    state.constellation = await response.json();
-    state.prevStarPositions = [];
-    if (reducedMotion.matches) {
-      drawCanvas(false);
-    }
+    state.constellation = await fetchJson(
+      `/api/constellation?seed=${state.constellationSeed}&points=${points}`
+    );
   } catch (error) {
     console.warn("constellation endpoint unavailable", error);
-    state.constellation = null;
+    state.constellation = generateConstellation(state.constellationSeed, points);
   }
+  state.prevStarPositions = [];
+  if (reducedMotion.matches) {
+    drawCanvas(false);
+  }
+}
+
+async function loadSkyAndOrbit() {
+  const seedText = elements.seed?.value || "sebby";
+  const layers = layerCountFromIntensity();
+  const planets = planetCountFromIntensity();
+  try {
+    state.sky = await fetchJson(`/api/sky?seed=${encodeURIComponent(seedText)}&layers=${layers}`);
+  } catch (error) {
+    console.warn("sky endpoint unavailable", error);
+    state.sky = generateSky(seedText, layers);
+  }
+  try {
+    state.orbit = await fetchJson(`/api/orbit?seed=${state.constellationSeed}&planets=${planets}`);
+  } catch (error) {
+    console.warn("orbit endpoint unavailable", error);
+    state.orbit = generateOrbit(state.constellationSeed, planets);
+  }
+  rebuildDust();
 }
 
 async function loadMission() {
   elements.generate.disabled = true;
   try {
-    const response = await fetch(apiUrl());
-    if (!response.ok) throw new Error("mission request failed");
-    state.mission = await response.json();
+    try {
+      const response = await fetch(apiUrl());
+      if (!response.ok) throw new Error("mission request failed");
+      state.mission = await response.json();
+      state.usingFallback = false;
+    } catch (error) {
+      console.warn("mission endpoint unavailable, using local generator", error);
+      state.mission = generateMission();
+      state.usingFallback = true;
+    }
     if (state.mission.paletteId) {
       state.paletteId = state.mission.paletteId;
       renderPalettePicker();
     }
     state.prevNodePositions = [];
+    await Promise.all([loadConstellation(), loadSkyAndOrbit()]);
     renderMission();
-    await loadConstellation();
     if (reducedMotion.matches) {
       drawCanvas(false);
     }
   } catch (error) {
     elements.missionName.textContent = "Signal interrupted";
-    elements.missionTagline.textContent = "The C++ server did not return a mission packet.";
+    elements.missionTagline.textContent = "The workspace could not build a mission packet.";
     console.error(error);
   } finally {
     elements.generate.disabled = false;
@@ -419,7 +711,11 @@ function renderMission() {
 
   elements.missionName.textContent = mission.missionName;
   elements.missionTagline.textContent = mission.tagline;
-  elements.updatedAt.textContent = `Updated ${new Date(mission.updatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+  if (state.usingFallback) {
+    elements.updatedAt.textContent = "Local generator — static demo without the C++ server";
+  } else {
+    elements.updatedAt.textContent = `Updated ${new Date(mission.updatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+  }
   elements.modeBadge.textContent = modeTitle(mission.mode);
   elements.paletteName.textContent = mission.paletteName || mission.seed;
 
@@ -448,7 +744,7 @@ function renderMission() {
 }
 
 /* ---------------------------------------------------------------------------
- * Canvas rendering: nebula, grid, constellation, nodes, shooting stars, warp
+ * Canvas rendering: nebula, dust, aurora, orrery, constellation, warp
  * ------------------------------------------------------------------------- */
 
 const nebula = { blobs: [], paletteKey: "" };
@@ -482,12 +778,75 @@ function buildNebula(palette) {
   });
 }
 
-function drawNebula(width, height) {
+function drawPaletteNebula(width, height) {
   nebula.blobs.forEach((blob) => {
     const x = width * (0.5 + 0.34 * Math.sin(state.time * blob.speed + blob.phaseX)) - blob.canvas.width / 2;
     const y = height * (0.5 + 0.3 * Math.cos(state.time * blob.speed * 0.8 + blob.phaseY)) - blob.canvas.height / 2;
     ctx.drawImage(blob.canvas, x, y);
   });
+}
+
+function drawSkyNebula(width, height) {
+  const sky = state.sky;
+  if (!sky || !Array.isArray(sky.layers)) return;
+  sky.layers.forEach((layer) => {
+    const x = (layer.x ?? 0.5) * width;
+    const y = (layer.y ?? 0.5) * height;
+    const radius = Math.max(40, (layer.radius ?? 0.4) * Math.max(width, height));
+    const gradient = ctx.createRadialGradient(x, y, 0, x, y, radius);
+    const hue = layer.hue ?? 220;
+    const sat = layer.sat ?? 60;
+    const light = layer.light ?? 40;
+    const alpha = layer.alpha ?? 0.3;
+    gradient.addColorStop(0, `hsla(${hue}, ${sat}%, ${light}%, ${alpha})`);
+    gradient.addColorStop(0.55, `hsla(${hue}, ${sat}%, ${light}%, ${alpha * 0.35})`);
+    gradient.addColorStop(1, `hsla(${hue}, ${sat}%, ${light}%, 0)`);
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, width, height);
+  });
+  ctx.fillStyle = `rgba(6, 8, 16, ${0.1 + (sky.haze ?? 0) * 0.32})`;
+  ctx.fillRect(0, 0, width, height);
+}
+
+function drawDust(width, height) {
+  if (!state.dust.length) return;
+  ctx.save();
+  state.dust.forEach((mote) => {
+    const twinkle = reducedMotion.matches
+      ? 0.45
+      : 0.22 + 0.78 * (0.5 + 0.5 * Math.sin(state.time * 2.4 + mote.tw));
+    ctx.globalAlpha = twinkle * (0.35 + mote.z * 0.65);
+    ctx.fillStyle = "#e8eef7";
+    const size = 0.7 + mote.z * 1.6;
+    ctx.fillRect(mote.x * width, mote.y * height, size, size);
+  });
+  ctx.restore();
+}
+
+function drawAurora(width, height) {
+  const aurora = state.sky && state.sky.aurora;
+  if (!aurora || !aurora.enabled) return;
+  const amp = (aurora.amplitude || 0.4) * height * 0.16;
+  const speed = aurora.speed || 0.4;
+  const t = reducedMotion.matches ? 0 : state.time * (0.55 + speed * 2.1);
+  ctx.save();
+  ctx.globalCompositeOperation = "lighter";
+  ctx.lineCap = "round";
+  for (let band = 0; band < 3; band += 1) {
+    ctx.beginPath();
+    const y0 = height * (0.16 + band * 0.065);
+    ctx.moveTo(0, y0);
+    for (let x = 0; x <= width; x += 6) {
+      const y = y0
+        + Math.sin(x * 0.009 + t + band) * amp * (1 - band * 0.2)
+        + Math.sin(x * 0.021 - t * 1.35 + band * 1.7) * amp * 0.38;
+      ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = `hsla(${(aurora.hue || 140) + band * 16}, 82%, 64%, ${0.2 - band * 0.045})`;
+    ctx.lineWidth = 8 - band * 2;
+    ctx.stroke();
+  }
+  ctx.restore();
 }
 
 function maybeSpawnShootingStar(width, height) {
@@ -626,7 +985,7 @@ function drawConstellationLayer(width, height, palette) {
       const b = stars[link[1]];
       if (!a || !b) return;
       ctx.strokeStyle = palette[3] || "#d85d4c";
-      ctx.globalAlpha = 0.08 + (index % 3) * 0.03;
+      ctx.globalAlpha = 0.05 + (index % 3) * 0.02;
       ctx.beginPath();
       ctx.moveTo(a.x, a.y);
       ctx.lineTo(b.x, b.y);
@@ -635,35 +994,169 @@ function drawConstellationLayer(width, height, palette) {
   }
 
   stars.forEach((star) => {
-    ctx.globalAlpha = 0.25 + star.brightness * 0.55;
+    ctx.globalAlpha = 0.18 + star.brightness * 0.4;
     ctx.fillStyle = palette[1] || "#f7f2e8";
     ctx.beginPath();
-    ctx.arc(star.x, star.y, star.size * 0.55, 0, Math.PI * 2);
+    ctx.arc(star.x, star.y, star.size * 0.45, 0, Math.PI * 2);
     ctx.fill();
   });
   ctx.restore();
+}
+
+function drawOrbitSystem(width, height) {
+  const pack = state.orbit;
+  if (!orbitEnabled() || !pack) return;
+
+  const cx = width / 2;
+  const cy = height / 2;
+  const scale = Math.min(width, height);
+  const t = reducedMotion.matches ? 0 : state.time;
+  const star = pack.star || { color: "#ffcc66", radius: 0.08, flare: 0.4 };
+  const planets = pack.planets || [];
+
+  ctx.save();
+  planets.forEach((planet) => {
+    const rx = (planet.orbit || 0.4) * scale * 0.48;
+    const ry = rx * 0.62;
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+    ctx.strokeStyle = "rgba(251, 250, 246, 0.11)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  });
+
+  const sr = Math.max(8, (star.radius || 0.08) * scale * 0.5);
+  const glowR = sr * (2.8 + (star.flare || 0.4) * 4.2);
+  const glow = ctx.createRadialGradient(cx, cy, 0, cx, cy, glowR);
+  glow.addColorStop(0, hexToRgba(star.color, 0.95));
+  glow.addColorStop(0.22, hexToRgba(star.color, 0.45));
+  glow.addColorStop(1, hexToRgba(star.color, 0));
+  ctx.fillStyle = glow;
+  ctx.beginPath();
+  ctx.arc(cx, cy, glowR, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(t * 0.04);
+  ctx.strokeStyle = hexToRgba(star.color, 0.28 + (star.flare || 0) * 0.35);
+  ctx.lineWidth = 1.6;
+  ctx.lineCap = "round";
+  const spikes = 8;
+  for (let i = 0; i < spikes; i += 1) {
+    const a = (i / spikes) * Math.PI * 2;
+    const len = sr * (2.1 + (star.flare || 0.4) * 2.4);
+    ctx.beginPath();
+    ctx.moveTo(Math.cos(a) * sr * 0.4, Math.sin(a) * sr * 0.4);
+    ctx.lineTo(Math.cos(a) * len, Math.sin(a) * len);
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  const core = ctx.createRadialGradient(cx - sr * 0.25, cy - sr * 0.25, sr * 0.1, cx, cy, sr);
+  core.addColorStop(0, "#fff8e6");
+  core.addColorStop(0.45, star.color || "#ffcc66");
+  core.addColorStop(1, hexToRgba(star.color, 0.85));
+  ctx.fillStyle = core;
+  ctx.beginPath();
+  ctx.arc(cx, cy, sr, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  const showLabels = width > 640;
+  planets.forEach((planet) => {
+    const rx = (planet.orbit || 0.4) * scale * 0.48;
+    const ry = rx * 0.62;
+    const period = Math.max(0.001, planet.period || 12);
+    const angle = (planet.phase || 0) + t * ((Math.PI * 2) / period);
+    const warped = warpPosition(cx + Math.cos(angle) * rx, cy + Math.sin(angle) * ry, width, height);
+    const px = warped.x;
+    const py = warped.y;
+    const pr = Math.max(3, (planet.radius || 0.02) * scale * 0.5);
+
+    if (planet.ring) {
+      ctx.save();
+      ctx.translate(px, py);
+      ctx.rotate(0.45 + angle * 0.04);
+      ctx.strokeStyle = hexToRgba(planet.color, 0.62);
+      ctx.lineWidth = Math.max(1.2, pr * 0.28);
+      ctx.beginPath();
+      ctx.ellipse(0, 0, pr * 2.25, pr * 0.72, 0, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    const shade = ctx.createRadialGradient(px - pr * 0.35, py - pr * 0.4, pr * 0.12, px, py, pr);
+    shade.addColorStop(0, "#fff7e8");
+    shade.addColorStop(0.28, planet.color || "#c79a34");
+    shade.addColorStop(1, hexToRgba(planet.color, 0.7));
+    ctx.fillStyle = shade;
+    ctx.beginPath();
+    ctx.arc(px, py, pr, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(251, 250, 246, 0.22)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    const moons = planet.moons | 0;
+    for (let m = 0; m < moons; m += 1) {
+      const ma = angle * (2.2 + m * 0.35) + m * 1.7 + t * (0.9 + m * 0.2);
+      const md = pr * (2.3 + m * 0.85);
+      ctx.fillStyle = "rgba(251, 250, 246, 0.88)";
+      ctx.beginPath();
+      ctx.arc(px + Math.cos(ma) * md, py + Math.sin(ma) * md * 0.68, Math.max(1.1, pr * 0.18), 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    if (showLabels && planet.name) {
+      ctx.font = "700 11px Inter, ui-sans-serif, system-ui, sans-serif";
+      ctx.fillStyle = "rgba(251, 250, 246, 0.72)";
+      ctx.fillText(planet.name, px + pr + 6, py - 2);
+    }
+  });
+}
+
+function drawVignette(width, height) {
+  const gradient = ctx.createRadialGradient(
+    width / 2, height / 2, Math.min(width, height) * 0.18,
+    width / 2, height / 2, Math.max(width, height) * 0.72
+  );
+  gradient.addColorStop(0, "rgba(0, 0, 0, 0)");
+  gradient.addColorStop(1, "rgba(4, 5, 10, 0.5)");
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, width, height);
 }
 
 function drawCanvas(advance = true) {
   const width = elements.canvas.clientWidth;
   const height = elements.canvas.clientHeight;
   const mission = state.mission;
+  const palette = (mission && mission.palette) || FALLBACK_PALETTES[0].colors;
   if (advance) {
     state.time += 0.008 + Number(elements.tempo.value) / 28000;
     state.warpAmount += ((state.warp ? 1 : 0) - state.warpAmount) * 0.06;
   }
 
   ctx.clearRect(0, 0, width, height);
-  ctx.fillStyle = "#171717";
+  ctx.fillStyle = "#0c0d12";
   ctx.fillRect(0, 0, width, height);
 
-  if (mission) {
-    const palette = mission.palette;
-    drawNebula(width, height);
-    drawGrid(width, height, palette);
-    drawConstellationLayer(width, height, palette);
+  if (nebulaEnabled()) {
+    if (state.sky && state.sky.layers) {
+      drawSkyNebula(width, height);
+    } else {
+      drawPaletteNebula(width, height);
+    }
+    drawDust(width, height);
+    drawAurora(width, height);
+  }
 
+  drawGrid(width, height, palette);
+  drawConstellationLayer(width, height, palette);
+
+  if (mission && mission.nodes) {
     const drifting = !reducedMotion.matches;
+    const dim = orbitEnabled() ? 0.42 : 1;
     const nodes = mission.nodes.map((node, index) => {
       const drift = drifting ? Math.sin(state.time * (1.5 + index * 0.03) + index) * 10 : 0;
       const wobble = drifting ? Math.cos(state.time + index) * 8 : 0;
@@ -684,12 +1177,12 @@ function drawCanvas(advance = true) {
 
     ctx.save();
     ctx.lineWidth = 1.4;
-    mission.links.forEach((link, index) => {
+    (mission.links || []).forEach((link, index) => {
       const a = nodes[link[0]];
       const b = nodes[link[1]];
       if (!a || !b) return;
       ctx.strokeStyle = index % 3 === 0 ? palette[2] : index % 3 === 1 ? palette[3] : palette[4];
-      ctx.globalAlpha = elements.trails.checked ? 0.27 : 0.14;
+      ctx.globalAlpha = (elements.trails.checked ? 0.2 : 0.1) * dim;
       ctx.beginPath();
       ctx.moveTo(a.x, a.y);
       const midX = (a.x + b.x) / 2 + Math.sin(state.time + index) * 26;
@@ -702,7 +1195,7 @@ function drawCanvas(advance = true) {
     nodes.forEach((node, index) => {
       const color = palette[2 + (index % 4)] || "#247c76";
       ctx.save();
-      ctx.globalAlpha = 0.9;
+      ctx.globalAlpha = 0.55 * dim;
       ctx.fillStyle = color;
       ctx.strokeStyle = "rgba(251, 250, 246, 0.78)";
       ctx.lineWidth = 1;
@@ -712,20 +1205,23 @@ function drawCanvas(advance = true) {
       if (node.energy > 70) ctx.stroke();
       ctx.restore();
     });
+  }
 
-    maybeSpawnShootingStar(width, height);
-    drawShootingStars(width, height, palette);
+  drawOrbitSystem(width, height);
+  drawVignette(width, height);
 
-    if (state.pointer.active) {
-      ctx.save();
-      ctx.strokeStyle = palette[5] || "#6e62a6";
-      ctx.globalAlpha = 0.45;
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.arc(state.pointer.x * width, state.pointer.y * height, 56, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.restore();
-    }
+  maybeSpawnShootingStar(width, height);
+  drawShootingStars(width, height, palette);
+
+  if (state.pointer.active) {
+    ctx.save();
+    ctx.strokeStyle = palette[5] || "#6e62a6";
+    ctx.globalAlpha = 0.45;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(state.pointer.x * width, state.pointer.y * height, 56, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
   }
 }
 
@@ -808,6 +1304,12 @@ function bindShortcuts() {
       case "w":
         setWarp(!state.warp);
         break;
+      case "o":
+        if (elements.orbitToggle) {
+          elements.orbitToggle.checked = !elements.orbitToggle.checked;
+          if (reducedMotion.matches) drawCanvas(false);
+        }
+        break;
       case "1":
         setMode("pulse");
         break;
@@ -848,6 +1350,12 @@ function bindEvents() {
     input.addEventListener("change", loadMission);
   });
 
+  [elements.grid, elements.trails, elements.orbitToggle, elements.nebulaToggle].forEach((input) => {
+    input?.addEventListener("change", () => {
+      if (reducedMotion.matches) drawCanvas(false);
+    });
+  });
+
   elements.seed.addEventListener("change", loadMission);
   elements.generate.addEventListener("click", loadMission);
   elements.randomizeSeed.addEventListener("click", () => {
@@ -861,8 +1369,9 @@ function bindEvents() {
     elements.reseedConstellation.addEventListener("click", async () => {
       state.constellationSeed = Math.floor(Math.random() * 1000000);
       elements.reseedConstellation.disabled = true;
-      await loadConstellation();
+      await Promise.all([loadConstellation(), loadSkyAndOrbit()]);
       elements.reseedConstellation.disabled = false;
+      if (reducedMotion.matches) drawCanvas(false);
     });
   }
 
@@ -880,7 +1389,13 @@ function bindEvents() {
 
   elements.copy.addEventListener("click", async () => {
     if (!state.mission) return;
-    await navigator.clipboard.writeText(JSON.stringify(state.mission, null, 2));
+    const payload = {
+      mission: state.mission,
+      sky: state.sky,
+      orbit: state.orbit,
+      constellation: state.constellation
+    };
+    await navigator.clipboard.writeText(JSON.stringify(payload, null, 2));
     elements.copy.textContent = "Copied";
     window.setTimeout(() => {
       elements.copy.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7a3 3 0 0 1 3-3h6a3 3 0 0 1 3 3v6a3 3 0 0 1-3 3h-1v1a3 3 0 0 1-3 3H7a3 3 0 0 1-3-3v-6a3 3 0 0 1 3-3h1V7zm3-1a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V7a1 1 0 0 0-1-1h-6zM7 10a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1v-1h-3a3 3 0 0 1-3-3v-3H7z"></path></svg>Copy JSON';
@@ -902,6 +1417,7 @@ function bindEvents() {
   window.addEventListener("resize", resizeCanvas);
 }
 
+readUrlState();
 resizeCanvas();
 bindEvents();
 bindShortcuts();
