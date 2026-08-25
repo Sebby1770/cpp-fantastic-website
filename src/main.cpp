@@ -19,7 +19,7 @@ int main(int argc, char** argv) {
 
     try {
         const aster::CliOptions options = aster::parse_cli(argc, argv);
-        aster::Server server(options.port, aster::find_public_dir(), options.quiet);
+        aster::Server server(options, aster::find_public_dir());
         return server.run(g_running);
     } catch (const std::exception& error) {
         std::cerr << "AsterForge failed: " << error.what() << "\n";

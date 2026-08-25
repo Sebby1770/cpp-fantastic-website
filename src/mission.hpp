@@ -3,6 +3,9 @@
 #include "util.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <iomanip>
 #include <map>
 #include <random>
 #include <sstream>
@@ -81,6 +84,159 @@ inline std::string build_constellation_json(const std::map<std::string, std::str
     return json.str();
 }
 
+inline std::string rgb_hex(int r, int g, int b) {
+    std::ostringstream out;
+    out << '#' << std::hex << std::nouppercase << std::setfill('0') << std::setw(2)
+        << std::clamp(r, 0, 255) << std::setw(2) << std::clamp(g, 0, 255) << std::setw(2)
+        << std::clamp(b, 0, 255);
+    return out.str();
+}
+
+inline std::string hsl_to_hex(double hue, double sat, double light) {
+    sat = std::clamp(sat, 0.0, 1.0);
+    light = std::clamp(light, 0.0, 1.0);
+    const double chroma = (1.0 - std::abs(2.0 * light - 1.0)) * sat;
+    double hp = std::fmod(hue, 360.0);
+    if (hp < 0.0) {
+        hp += 360.0;
+    }
+    hp /= 60.0;
+    const double x = chroma * (1.0 - std::abs(std::fmod(hp, 2.0) - 1.0));
+    double r = 0.0;
+    double g = 0.0;
+    double b = 0.0;
+    if (hp < 1.0) {
+        r = chroma;
+        g = x;
+    } else if (hp < 2.0) {
+        r = x;
+        g = chroma;
+    } else if (hp < 3.0) {
+        g = chroma;
+        b = x;
+    } else if (hp < 4.0) {
+        g = x;
+        b = chroma;
+    } else if (hp < 5.0) {
+        r = x;
+        b = chroma;
+    } else {
+        r = chroma;
+        b = x;
+    }
+    const double m = light - chroma / 2.0;
+    const auto to_byte = [](double channel) {
+        return std::clamp(static_cast<int>(std::lround(channel * 255.0)), 0, 255);
+    };
+    return rgb_hex(to_byte(r + m), to_byte(g + m), to_byte(b + m));
+}
+
+inline std::string build_sky_json(const std::map<std::string, std::string>& query) {
+    const std::string seed_text = string_param(query, "seed", "sebby");
+    const int layers = int_param(query, "layers", 4, 2, 8);
+
+    std::mt19937 rng(stable_seed(seed_text + ":sky:" + std::to_string(layers)));
+    std::uniform_real_distribution<double> unit(0.0, 1.0);
+    std::uniform_real_distribution<double> hue_dist(0.0, 360.0);
+    std::uniform_real_distribution<double> sat_dist(28.0, 92.0);
+    std::uniform_real_distribution<double> light_dist(18.0, 72.0);
+    std::uniform_real_distribution<double> pos(0.08, 0.92);
+    std::uniform_real_distribution<double> radius_dist(0.16, 0.78);
+    std::uniform_real_distribution<double> alpha_dist(0.12, 0.62);
+    std::uniform_int_distribution<int> dust_dist(20, 220);
+
+    std::ostringstream json;
+    json << std::fixed << std::setprecision(4);
+    json << "{";
+    json << "\"seed\":\"" << json_escape(seed_text) << "\",";
+    json << "\"version\":\"" << kVersion << "\",";
+    json << "\"haze\":" << unit(rng) << ",";
+    json << "\"layers\":[";
+    for (int i = 0; i < layers; ++i) {
+        if (i) json << ",";
+        json << "{\"hue\":" << hue_dist(rng)
+             << ",\"sat\":" << sat_dist(rng)
+             << ",\"light\":" << light_dist(rng)
+             << ",\"x\":" << pos(rng)
+             << ",\"y\":" << pos(rng)
+             << ",\"radius\":" << radius_dist(rng)
+             << ",\"alpha\":" << alpha_dist(rng) << "}";
+    }
+    json << "],";
+    json << "\"dust\":" << dust_dist(rng) << ",";
+    json << "\"aurora\":{";
+    json << "\"enabled\":" << (unit(rng) > 0.32 ? "true" : "false") << ",";
+    json << "\"hue\":" << hue_dist(rng) << ",";
+    json << "\"amplitude\":" << unit(rng) << ",";
+    json << "\"speed\":" << unit(rng);
+    json << "}";
+    json << "}";
+    return json.str();
+}
+
+inline const std::vector<std::string>& planet_names() {
+    static const std::vector<std::string> names = {
+        "Aether", "Nyx", "Helios", "Selene", "Atlas", "Lyra", "Vega", "Rigel",
+        "Electra", "Thalassa", "Hyperion", "Andromeda", "Cassiopeia", "Orion",
+        "Perseus", "Io"};
+    return names;
+}
+
+inline std::string build_orbit_json(const std::map<std::string, std::string>& query) {
+    const int seed = int_param(query, "seed", 42, 0, 1000000);
+    const int planet_count = int_param(query, "planets", 6, 3, 10);
+
+    std::mt19937 rng(static_cast<std::uint32_t>(seed) * 2654435761u + 1337u);
+    std::uniform_real_distribution<double> unit(0.0, 1.0);
+    std::uniform_real_distribution<double> radius_dist(0.01, 0.05);
+    std::uniform_real_distribution<double> phase_dist(0.0, 6.2832);
+    std::uniform_int_distribution<int> moon_dist(0, 3);
+
+    std::vector<std::string> names = planet_names();
+    std::shuffle(names.begin(), names.end(), rng);
+
+    const double star_hue = 32.0 + unit(rng) * 28.0;
+    const std::string star_color = hsl_to_hex(star_hue, 0.82 + unit(rng) * 0.16, 0.62 + unit(rng) * 0.12);
+    const double star_radius = 0.07 + unit(rng) * 0.03;
+    const double star_flare = 0.18 + unit(rng) * 0.62;
+
+    std::ostringstream json;
+    json << std::fixed << std::setprecision(4);
+    json << "{";
+    json << "\"seed\":" << seed << ",";
+    json << "\"version\":\"" << kVersion << "\",";
+    json << "\"star\":{";
+    json << "\"color\":\"" << star_color << "\",";
+    json << "\"radius\":" << star_radius << ",";
+    json << "\"flare\":" << star_flare;
+    json << "},";
+    json << "\"planets\":[";
+    const double span = 0.80;
+    const double gap = planet_count > 1 ? span / (planet_count - 1) : 0.0;
+    for (int i = 0; i < planet_count; ++i) {
+        if (i) json << ",";
+        const double jitter = (unit(rng) - 0.5) * gap * 0.22;
+        const double orbit = std::clamp(0.12 + gap * static_cast<double>(i) + jitter, 0.12, 0.92);
+        const double period = std::clamp(4.0 + 36.0 * ((orbit - 0.12) / span) + (unit(rng) - 0.5) * 3.0,
+                                         4.0, 40.0);
+        const double hue = unit(rng) * 360.0;
+        const std::string color = hsl_to_hex(hue, 0.42 + unit(rng) * 0.45, 0.38 + unit(rng) * 0.28);
+        const std::string name = names[static_cast<std::size_t>(i) % names.size()];
+        json << "{";
+        json << "\"name\":\"" << json_escape(name) << "\",";
+        json << "\"color\":\"" << color << "\",";
+        json << "\"orbit\":" << orbit << ",";
+        json << "\"radius\":" << radius_dist(rng) << ",";
+        json << "\"period\":" << period << ",";
+        json << "\"phase\":" << phase_dist(rng) << ",";
+        json << "\"moons\":" << moon_dist(rng) << ",";
+        json << "\"ring\":" << (unit(rng) < 0.22 ? "true" : "false");
+        json << "}";
+    }
+    json << "]}";
+    return json.str();
+}
+
 inline std::string build_mission_json(const std::map<std::string, std::string>& query) {
     const std::string seed_text = string_param(query, "seed", "sebby");
     const std::string mode = string_param(query, "mode", "pulse");
@@ -134,7 +290,7 @@ inline std::string build_mission_json(const std::map<std::string, std::string>& 
     std::ostringstream json;
     json << "{";
     json << "\"app\":\"AsterForge\",";
-    json << "\"version\":\"" << "1.2.0" << "\",";
+    json << "\"version\":\"" << kVersion << "\",";
     json << "\"seed\":\"" << json_escape(seed_text) << "\",";
     json << "\"mode\":\"" << json_escape(mode) << "\",";
     json << "\"intensity\":" << intensity << ",";
