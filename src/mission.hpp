@@ -237,6 +237,38 @@ inline std::string build_orbit_json(const std::map<std::string, std::string>& qu
     return json.str();
 }
 
+inline std::string build_comet_json(const std::map<std::string, std::string>& query) {
+    const int seed = int_param(query, "seed", 7, 0, 1000000);
+    const int count = int_param(query, "count", 2, 1, 6);
+
+    std::mt19937 rng(static_cast<std::uint32_t>(seed) * 2654435761u + 2407u);
+    std::uniform_real_distribution<double> pos(0.0, 1.0);
+    std::uniform_real_distribution<double> dx_dist(-0.4, 0.4);
+    std::uniform_real_distribution<double> dy_dist(-0.2, 0.2);
+    std::uniform_real_distribution<double> len_dist(0.05, 0.25);
+    std::uniform_real_distribution<double> hue_dist(0.0, 360.0);
+
+    std::ostringstream json;
+    json << std::fixed << std::setprecision(4);
+    json << "{";
+    json << "\"seed\":" << seed << ",";
+    json << "\"version\":\"" << kVersion << "\",";
+    json << "\"comets\":[";
+    for (int i = 0; i < count; ++i) {
+        if (i) json << ",";
+        json << "{";
+        json << "\"x\":" << pos(rng) << ",";
+        json << "\"y\":" << pos(rng) << ",";
+        json << "\"dx\":" << dx_dist(rng) << ",";
+        json << "\"dy\":" << dy_dist(rng) << ",";
+        json << "\"len\":" << len_dist(rng) << ",";
+        json << "\"hue\":" << hue_dist(rng);
+        json << "}";
+    }
+    json << "]}";
+    return json.str();
+}
+
 inline std::string build_mission_json(const std::map<std::string, std::string>& query) {
     const std::string seed_text = string_param(query, "seed", "sebby");
     const std::string mode = string_param(query, "mode", "pulse");

@@ -3,6 +3,28 @@
 All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.4.0] - 2026-08-25
+
+Comets, planet inspect, and orbital time scale on top of the 2.3 orrery.
+
+### Added
+
+- `GET /api/comet` — deterministic comet / shooting-body packet from an integer
+  `seed` (default 7) and `count` (1–6, default 2). Each body has `x`/`y` in
+  0–1, `dx` −0.4–0.4, `dy` −0.2–0.2, `len` 0.05–0.25, and `hue` 0–360.
+  Seeded with `mt19937`. POST is `405`. Listed on `/api/version`.
+- Frontend comet streaks from `/api/comet`, with an in-browser generator when
+  the API is missing. Keyboard `c` (and a Comet toggle) show or hide them.
+- Click a planet to inspect it: name, orbit, period, moons, and ring on a
+  small glass card on the stage.
+- Orbital time scale buttons (0.25× / 1× / 4×) that multiply orbital speed.
+  `prefers-reduced-motion` still freezes orbits.
+
+### Changed
+
+- Version **2.4.0**; `aster::kVersion` and CMake `VERSION` bumped together.
+- `/api/version` endpoint list includes `/api/comet`.
+
 ## [2.3.0] - 2026-08-25
 
 Orbital skybox: a living orrery on the stage, two new deterministic JSON APIs,

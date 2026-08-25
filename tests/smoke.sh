@@ -55,6 +55,13 @@ curl -fsS "$BASE/api/version" | grep -q '/api/orbit'
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/orbit")
 [ "$CODE" = "405" ]
 
+echo "== comet =="
+curl -fsS "$BASE/api/comet?seed=7&count=2" | grep -q '"comets"'
+curl -fsS "$BASE/api/comet?seed=7&count=2" | grep -q '"hue"'
+curl -fsS "$BASE/api/version" | grep -q '/api/comet'
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/comet")
+[ "$CODE" = "405" ]
+
 echo "== unknown api 404 =="
 CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/does-not-exist")
 [ "$CODE" = "404" ]
@@ -207,6 +214,11 @@ grep -q 'nebulaToggle' "$ROOT_DIR/public/index.html"
 grep -q 'generateSky' "$ROOT_DIR/public/app.js"
 grep -q 'generateOrbit' "$ROOT_DIR/public/app.js"
 grep -q 'generateConstellation' "$ROOT_DIR/public/app.js"
+grep -q 'generateComet' "$ROOT_DIR/public/app.js"
+grep -q '/api/comet' "$ROOT_DIR/public/app.js"
+grep -q 'cometToggle' "$ROOT_DIR/public/index.html"
+grep -q 'planetInspect' "$ROOT_DIR/public/index.html"
+grep -q 'data-timescale' "$ROOT_DIR/public/index.html"
 grep -q 'prefers-reduced-motion' "$ROOT_DIR/public/styles.css"
 grep -q 'prefers-reduced-motion' "$ROOT_DIR/public/app.js"
 

@@ -463,7 +463,7 @@ int main() {
     expect_true("stable_seed distinguishes", aster::stable_seed("orion") != aster::stable_seed("lyra"));
     expect_true("stable_seed empty fnv basis", aster::stable_seed("") == 2166136261u);
 
-    expect_eq("version constant", std::string(aster::kVersion), "2.3.0");
+    expect_eq("version constant", std::string(aster::kVersion), "2.4.0");
 
     auto count_key = [](const std::string& hay, const std::string& needle) {
         int n = 0;
@@ -483,7 +483,7 @@ int main() {
         expect_true("sky has haze", sky1.find("\"haze\"") != std::string::npos);
         expect_true("sky has dust", sky1.find("\"dust\"") != std::string::npos);
         expect_true("sky has aurora", sky1.find("\"aurora\"") != std::string::npos);
-        expect_true("sky version", sky1.find("\"version\":\"2.3.0\"") != std::string::npos);
+        expect_true("sky version", sky1.find("\"version\":\"2.4.0\"") != std::string::npos);
         expect_true("sky four layers", count_key(sky1, "\"sat\":") == 4);
         const std::string sky_other = aster::build_sky_json({{"seed", "lyra"}, {"layers", "4"}});
         expect_true("sky seed distinguishes", sky1 != sky_other);
@@ -500,7 +500,7 @@ int main() {
         expect_eq("orbit deterministic", orbit1, orbit2);
         expect_true("orbit has planets", orbit1.find("\"planets\"") != std::string::npos);
         expect_true("orbit has star", orbit1.find("\"star\"") != std::string::npos);
-        expect_true("orbit version", orbit1.find("\"version\":\"2.3.0\"") != std::string::npos);
+        expect_true("orbit version", orbit1.find("\"version\":\"2.4.0\"") != std::string::npos);
         expect_true("orbit six planets", count_key(orbit1, "\"name\":") == 6);
         const std::string orbit_other = aster::build_orbit_json({{"seed", "43"}, {"planets", "6"}});
         expect_true("orbit seed distinguishes", orbit1 != orbit_other);
@@ -508,6 +508,25 @@ int main() {
         expect_true("orbit planets clamp high", count_key(orbit_high, "\"name\":") == 10);
         const std::string orbit_low = aster::build_orbit_json({{"seed", "42"}, {"planets", "1"}});
         expect_true("orbit planets clamp low", count_key(orbit_low, "\"name\":") == 3);
+    }
+
+    {
+        const std::map<std::string, std::string> comet_query{{"seed", "7"}, {"count", "2"}};
+        const std::string comet1 = aster::build_comet_json(comet_query);
+        const std::string comet2 = aster::build_comet_json(comet_query);
+        expect_eq("comet deterministic", comet1, comet2);
+        expect_true("comet has comets", comet1.find("\"comets\"") != std::string::npos);
+        expect_true("comet version", comet1.find("\"version\":\"2.4.0\"") != std::string::npos);
+        expect_true("comet default-seed field", comet1.find("\"seed\":7,") != std::string::npos);
+        expect_true("comet two bodies", count_key(comet1, "\"hue\":") == 2);
+        const std::string comet_default = aster::build_comet_json({});
+        expect_eq("comet default matches seed 7 count 2", comet_default, comet1);
+        const std::string comet_other = aster::build_comet_json({{"seed", "8"}, {"count", "2"}});
+        expect_true("comet seed distinguishes", comet1 != comet_other);
+        const std::string comet_high = aster::build_comet_json({{"seed", "7"}, {"count", "99"}});
+        expect_true("comet count clamp high", count_key(comet_high, "\"hue\":") == 6);
+        const std::string comet_low = aster::build_comet_json({{"seed", "7"}, {"count", "0"}});
+        expect_true("comet count clamp low", count_key(comet_low, "\"hue\":") == 1);
     }
 
     // Access log: both formats, and the sub-millisecond precision that an

@@ -1,4 +1,4 @@
-const CLIENT_VERSION = "2.3.0";
+const CLIENT_VERSION = "2.4.0";
 const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 
 const FALLBACK_PALETTES = [
@@ -24,17 +24,21 @@ const state = {
   constellationSeed: Math.floor(Math.random() * 10000),
   sky: null,
   orbit: null,
+  comets: null,
   dust: [],
   usingFallback: false,
   pointer: { x: 0.5, y: 0.5, active: false },
   time: 0,
+  timeScale: 1,
   warp: false,
   warpAmount: 0,
   telemetry: { history: [] },
   shootingStars: [],
   nextShootingStarAt: 0,
   prevStarPositions: [],
-  prevNodePositions: []
+  prevNodePositions: [],
+  planetHits: [],
+  inspected: null
 };
 
 const elements = {
@@ -56,6 +60,7 @@ const elements = {
   trails: document.querySelector("#trailToggle"),
   orbitToggle: document.querySelector("#orbitToggle"),
   nebulaToggle: document.querySelector("#nebulaToggle"),
+  cometToggle: document.querySelector("#cometToggle"),
   generate: document.querySelector("#generateButton"),
   randomizeSeed: document.querySelector("#randomizeSeed"),
   reseedConstellation: document.querySelector("#reseedConstellation"),
@@ -74,7 +79,14 @@ const elements = {
   latencyP99: document.querySelector("#latencyP99"),
   statusChips: document.querySelector("#statusChips"),
   telemetryTick: document.querySelector("#telemetryTick"),
-  shortcutOverlay: document.querySelector("#shortcutOverlay")
+  shortcutOverlay: document.querySelector("#shortcutOverlay"),
+  planetInspect: document.querySelector("#planetInspect"),
+  inspectName: document.querySelector("#inspectName"),
+  inspectOrbit: document.querySelector("#inspectOrbit"),
+  inspectPeriod: document.querySelector("#inspectPeriod"),
+  inspectMoons: document.querySelector("#inspectMoons"),
+  inspectRing: document.querySelector("#inspectRing"),
+  inspectClose: document.querySelector("#inspectClose")
 };
 
 const ctx = elements.canvas.getContext("2d");
@@ -108,6 +120,10 @@ function nebulaEnabled() {
 
 function orbitEnabled() {
   return !elements.orbitToggle || elements.orbitToggle.checked;
+}
+
+function cometEnabled() {
+  return !elements.cometToggle || elements.cometToggle.checked;
 }
 
 function stableSeed(value) {
@@ -217,6 +233,28 @@ function generateOrbit(seed, planets) {
     },
     planets: list
   };
+}
+
+function generateComet(seed, count) {
+  const parsedSeed = Number(seed);
+  const seedValue = Number.isFinite(parsedSeed)
+    ? Math.max(0, Math.min(1000000, parsedSeed))
+    : 7;
+  const parsedCount = Number(count);
+  const n = Math.max(1, Math.min(6, Number.isFinite(parsedCount) ? parsedCount : 2));
+  const rng = makeRng((Math.imul(seedValue, 2654435761) + 2407) >>> 0);
+  const comets = [];
+  for (let i = 0; i < n; i += 1) {
+    comets.push({
+      x: rng(),
+      y: rng(),
+      dx: -0.4 + rng() * 0.8,
+      dy: -0.2 + rng() * 0.4,
+      len: 0.05 + rng() * 0.2,
+      hue: rng() * 360
+    });
+  }
+  return { seed: seedValue, version: CLIENT_VERSION, comets };
 }
 
 function generateConstellation(seed, points) {
@@ -579,7 +617,7 @@ function drawSparkline() {
 }
 
 /* ---------------------------------------------------------------------------
- * Mission / palettes / constellation / sky / orbit
+ * Mission / palettes / constellation / sky / orbit / comet
  * ------------------------------------------------------------------------- */
 
 async function loadPalettes() {
@@ -626,6 +664,10 @@ function planetCountFromIntensity() {
   return Math.max(3, Math.min(10, 3 + Math.floor(Number(elements.intensity?.value || 68) / 16)));
 }
 
+function cometCountFromIntensity() {
+  return Math.max(1, Math.min(6, 1 + Math.floor(Number(elements.intensity?.value || 68) / 20)));
+}
+
 function rebuildDust() {
   const sky = state.sky;
   const n = sky ? Math.max(20, Math.min(220, Number(sky.dust) || 80)) : 0;
@@ -670,7 +712,22 @@ async function loadSkyAndOrbit() {
     console.warn("orbit endpoint unavailable", error);
     state.orbit = generateOrbit(state.constellationSeed, planets);
   }
+  const count = cometCountFromIntensity();
+  try {
+    state.comets = await fetchJson(`/api/comet?seed=${state.constellationSeed}&count=${count}`);
+  } catch (error) {
+    console.warn("comet endpoint unavailable", error);
+    state.comets = generateComet(state.constellationSeed, count);
+  }
   rebuildDust();
+  if (state.inspected) {
+    const bodies = (state.orbit && state.orbit.planets) || [];
+    if (state.inspected.index >= bodies.length) {
+      hidePlanetInspect();
+    } else {
+      showPlanetInspect(state.inspected.index);
+    }
+  }
 }
 
 async function loadMission() {
@@ -850,7 +907,7 @@ function drawAurora(width, height) {
 }
 
 function maybeSpawnShootingStar(width, height) {
-  if (reducedMotion.matches) return;
+  if (reducedMotion.matches || !cometEnabled()) return;
   const now = performance.now();
   if (state.nextShootingStarAt === 0) {
     state.nextShootingStarAt = now + 4000 + Math.random() * 5000;
@@ -869,7 +926,7 @@ function maybeSpawnShootingStar(width, height) {
 }
 
 function drawShootingStars(width, height, palette) {
-  if (!state.shootingStars.length) return;
+  if (!cometEnabled() || !state.shootingStars.length) return;
   ctx.save();
   ctx.lineCap = "round";
   state.shootingStars = state.shootingStars.filter((star) => {
@@ -1003,14 +1060,59 @@ function drawConstellationLayer(width, height, palette) {
   ctx.restore();
 }
 
+function wrap01(value) {
+  return ((value % 1) + 1) % 1;
+}
+
+function drawComets(width, height) {
+  const pack = state.comets;
+  if (!cometEnabled() || !pack || !Array.isArray(pack.comets)) return;
+
+  const scale = Math.min(width, height);
+  const travel = reducedMotion.matches ? 0 : state.time * state.timeScale * 0.35;
+
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.globalCompositeOperation = "lighter";
+  pack.comets.forEach((comet) => {
+    const dx = comet.dx ?? 0.12;
+    const dy = comet.dy ?? 0.04;
+    const x = wrap01((comet.x ?? 0.5) + dx * travel);
+    const y = wrap01((comet.y ?? 0.5) + dy * travel);
+    const len = Math.max(0.05, Math.min(0.25, comet.len ?? 0.12));
+    const mag = Math.hypot(dx, dy) || 1;
+    const px = x * width;
+    const py = y * height;
+    const tx = px - (dx / mag) * len * scale;
+    const ty = py - (dy / mag) * len * scale;
+    const hue = comet.hue ?? 40;
+    const gradient = ctx.createLinearGradient(tx, ty, px, py);
+    gradient.addColorStop(0, `hsla(${hue}, 90%, 70%, 0)`);
+    gradient.addColorStop(0.55, `hsla(${hue}, 95%, 72%, 0.45)`);
+    gradient.addColorStop(1, `hsla(${hue}, 100%, 88%, 0.95)`);
+    ctx.strokeStyle = gradient;
+    ctx.lineWidth = 2.4;
+    ctx.beginPath();
+    ctx.moveTo(tx, ty);
+    ctx.lineTo(px, py);
+    ctx.stroke();
+    ctx.fillStyle = `hsla(${hue}, 100%, 92%, 0.95)`;
+    ctx.beginPath();
+    ctx.arc(px, py, 2.2, 0, Math.PI * 2);
+    ctx.fill();
+  });
+  ctx.restore();
+}
+
 function drawOrbitSystem(width, height) {
   const pack = state.orbit;
+  state.planetHits = [];
   if (!orbitEnabled() || !pack) return;
 
   const cx = width / 2;
   const cy = height / 2;
   const scale = Math.min(width, height);
-  const t = reducedMotion.matches ? 0 : state.time;
+  const t = reducedMotion.matches ? 0 : state.time * state.timeScale;
   const star = pack.star || { color: "#ffcc66", radius: 0.08, flare: 0.4 };
   const planets = pack.planets || [];
 
@@ -1064,7 +1166,7 @@ function drawOrbitSystem(width, height) {
   ctx.restore();
 
   const showLabels = width > 640;
-  planets.forEach((planet) => {
+  planets.forEach((planet, index) => {
     const rx = (planet.orbit || 0.4) * scale * 0.48;
     const ry = rx * 0.62;
     const period = Math.max(0.001, planet.period || 12);
@@ -1073,6 +1175,7 @@ function drawOrbitSystem(width, height) {
     const px = warped.x;
     const py = warped.y;
     const pr = Math.max(3, (planet.radius || 0.02) * scale * 0.5);
+    state.planetHits.push({ index, x: px, y: py, r: pr });
 
     if (planet.ring) {
       ctx.save();
@@ -1097,6 +1200,14 @@ function drawOrbitSystem(width, height) {
     ctx.strokeStyle = "rgba(251, 250, 246, 0.22)";
     ctx.lineWidth = 1;
     ctx.stroke();
+
+    if (state.inspected && state.inspected.index === index) {
+      ctx.strokeStyle = "rgba(251, 250, 246, 0.88)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(px, py, pr + 5, 0, Math.PI * 2);
+      ctx.stroke();
+    }
 
     const moons = planet.moons | 0;
     for (let m = 0; m < moons; m += 1) {
@@ -1210,6 +1321,7 @@ function drawCanvas(advance = true) {
   drawOrbitSystem(width, height);
   drawVignette(width, height);
 
+  drawComets(width, height);
   maybeSpawnShootingStar(width, height);
   drawShootingStars(width, height, palette);
 
@@ -1257,6 +1369,44 @@ reducedMotion.addEventListener("change", () => {
 /* ---------------------------------------------------------------------------
  * Warp mode, keyboard shortcuts, overlay
  * ------------------------------------------------------------------------- */
+
+function hidePlanetInspect() {
+  state.inspected = null;
+  if (elements.planetInspect) {
+    elements.planetInspect.hidden = true;
+  }
+}
+
+function showPlanetInspect(index) {
+  const planet = state.orbit && state.orbit.planets && state.orbit.planets[index];
+  if (!planet || !elements.planetInspect) {
+    hidePlanetInspect();
+    return;
+  }
+  state.inspected = { index };
+  elements.inspectName.textContent = planet.name || `Body ${index + 1}`;
+  elements.inspectOrbit.textContent = Number(planet.orbit ?? 0).toFixed(2);
+  elements.inspectPeriod.textContent = `${Number(planet.period ?? 0).toFixed(1)}s`;
+  elements.inspectMoons.textContent = String(planet.moons | 0);
+  elements.inspectRing.textContent = planet.ring ? "yes" : "no";
+  elements.planetInspect.hidden = false;
+}
+
+function planetHitAt(x, y) {
+  let best = null;
+  let bestDist = Infinity;
+  (state.planetHits || []).forEach((hit) => {
+    const dx = x - hit.x;
+    const dy = y - hit.y;
+    const reach = hit.r + 10;
+    const dist = dx * dx + dy * dy;
+    if (dist <= reach * reach && dist < bestDist) {
+      best = hit;
+      bestDist = dist;
+    }
+  });
+  return best;
+}
 
 function setWarp(on) {
   if (reducedMotion.matches) {
@@ -1307,6 +1457,14 @@ function bindShortcuts() {
       case "o":
         if (elements.orbitToggle) {
           elements.orbitToggle.checked = !elements.orbitToggle.checked;
+          if (!elements.orbitToggle.checked) hidePlanetInspect();
+          if (reducedMotion.matches) drawCanvas(false);
+        }
+        break;
+      case "c":
+        if (elements.cometToggle) {
+          elements.cometToggle.checked = !elements.cometToggle.checked;
+          if (!elements.cometToggle.checked) state.shootingStars = [];
           if (reducedMotion.matches) drawCanvas(false);
         }
         break;
@@ -1323,7 +1481,12 @@ function bindShortcuts() {
         toggleShortcutOverlay();
         break;
       case "Escape":
-        toggleShortcutOverlay(false);
+        if (elements.planetInspect && !elements.planetInspect.hidden) {
+          hidePlanetInspect();
+          if (reducedMotion.matches) drawCanvas(false);
+        } else {
+          toggleShortcutOverlay(false);
+        }
         break;
       default:
         return;
@@ -1350,8 +1513,22 @@ function bindEvents() {
     input.addEventListener("change", loadMission);
   });
 
-  [elements.grid, elements.trails, elements.orbitToggle, elements.nebulaToggle].forEach((input) => {
+  [elements.grid, elements.trails, elements.orbitToggle, elements.nebulaToggle, elements.cometToggle].forEach((input) => {
     input?.addEventListener("change", () => {
+      if (input === elements.orbitToggle && !orbitEnabled()) hidePlanetInspect();
+      if (input === elements.cometToggle && !cometEnabled()) state.shootingStars = [];
+      if (reducedMotion.matches) drawCanvas(false);
+    });
+  });
+
+  document.querySelectorAll("[data-timescale]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.timeScale = Number(button.dataset.timescale) || 1;
+      document.querySelectorAll("[data-timescale]").forEach((item) => {
+        const active = item === button;
+        item.classList.toggle("active", active);
+        item.setAttribute("aria-pressed", String(active));
+      });
       if (reducedMotion.matches) drawCanvas(false);
     });
   });
@@ -1393,6 +1570,7 @@ function bindEvents() {
       mission: state.mission,
       sky: state.sky,
       orbit: state.orbit,
+      comets: state.comets,
       constellation: state.constellation
     };
     await navigator.clipboard.writeText(JSON.stringify(payload, null, 2));
@@ -1404,15 +1582,36 @@ function bindEvents() {
 
   elements.canvas.addEventListener("pointermove", (event) => {
     const rect = elements.canvas.getBoundingClientRect();
+    const x = event.clientX - rect.left;
+    const y = event.clientY - rect.top;
     state.pointer = {
-      x: (event.clientX - rect.left) / rect.width,
-      y: (event.clientY - rect.top) / rect.height,
+      x: x / rect.width,
+      y: y / rect.height,
       active: true
     };
+    elements.canvas.style.cursor = planetHitAt(x, y) ? "pointer" : "crosshair";
   });
   elements.canvas.addEventListener("pointerleave", () => {
     state.pointer.active = false;
+    elements.canvas.style.cursor = "crosshair";
   });
+  elements.canvas.addEventListener("click", (event) => {
+    const rect = elements.canvas.getBoundingClientRect();
+    const hit = planetHitAt(event.clientX - rect.left, event.clientY - rect.top);
+    if (hit) {
+      showPlanetInspect(hit.index);
+    } else {
+      hidePlanetInspect();
+    }
+    if (reducedMotion.matches) drawCanvas(false);
+  });
+
+  if (elements.inspectClose) {
+    elements.inspectClose.addEventListener("click", () => {
+      hidePlanetInspect();
+      if (reducedMotion.matches) drawCanvas(false);
+    });
+  }
 
   window.addEventListener("resize", resizeCanvas);
 }

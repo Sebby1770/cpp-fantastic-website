@@ -358,6 +358,13 @@ private:
             return json_response(build_orbit_json(request.query));
         }
 
+        if (request.path == "/api/comet") {
+            if (method == "POST") {
+                return method_not_allowed();
+            }
+            return json_response(build_comet_json(request.query));
+        }
+
         if (request.path == "/api/metrics") {
             if (method == "POST") {
                 return method_not_allowed();
@@ -397,7 +404,8 @@ private:
             json << "\"language\":\"C++17\",";
             json << "\"endpoints\":[\"/api/health\",\"/api/version\",\"/api/time\",\"/api/random\","
                     "\"/api/status\",\"/api/mission\",\"/api/palettes\",\"/api/constellation\","
-                    "\"/api/sky\",\"/api/orbit\",\"/api/metrics\",\"/api/stream\",\"/api/echo\"]";
+                    "\"/api/sky\",\"/api/orbit\",\"/api/comet\",\"/api/metrics\",\"/api/stream\","
+                    "\"/api/echo\"]";
             json << "}";
             return json_response(json.str());
         }

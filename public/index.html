@@ -53,6 +53,14 @@
           <span>Tempo <output id="tempoValue">42</output></span>
           <input id="tempoInput" type="range" min="1" max="100" value="42">
         </label>
+        <div class="field">
+          <span>Time scale</span>
+          <div id="timeScale" class="segmented time-scale" role="group" aria-label="Orbital time scale">
+            <button type="button" class="scale-button" data-timescale="0.25" aria-pressed="false">0.25×</button>
+            <button type="button" class="scale-button active" data-timescale="1" aria-pressed="true">1×</button>
+            <button type="button" class="scale-button" data-timescale="4" aria-pressed="false">4×</button>
+          </div>
+        </div>
         <label class="toggle-row">
           <input id="gridToggle" type="checkbox" checked>
           <span>Grid</span>
@@ -68,6 +76,10 @@
         <label class="toggle-row">
           <input id="nebulaToggle" type="checkbox" checked>
           <span>Nebula</span>
+        </label>
+        <label class="toggle-row">
+          <input id="cometToggle" type="checkbox" checked>
+          <span>Comets</span>
         </label>
         <button id="generateButton" class="primary-action" type="button">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l1.8 6.1L20 10l-6.2 1.9L12 18l-1.8-6.1L4 10l6.2-1.9L12 2z"></path><path d="M19 15l.8 2.7L22.5 18l-2.7.8L19 21.5l-.8-2.7-2.7-.8 2.7-.8L19 15z"></path></svg>
@@ -107,6 +119,17 @@
           </button>
         </div>
       </div>
+      <aside id="planetInspect" class="planet-inspect" hidden>
+        <button type="button" id="inspectClose" class="inspect-close" aria-label="Close planet inspect">×</button>
+        <p class="eyebrow">Planet</p>
+        <h3 id="inspectName">—</h3>
+        <dl class="inspect-stats">
+          <div><dt>Orbit</dt><dd id="inspectOrbit">—</dd></div>
+          <div><dt>Period</dt><dd id="inspectPeriod">—</dd></div>
+          <div><dt>Moons</dt><dd id="inspectMoons">—</dd></div>
+          <div><dt>Ring</dt><dd id="inspectRing">—</dd></div>
+        </dl>
+      </aside>
       <div id="metricStrip" class="metric-strip" aria-label="Live metrics"></div>
     </section>
 
@@ -164,6 +187,7 @@
         <div><dt><kbd>r</kbd></dt><dd>Reseed the constellation sky</dd></div>
         <div><dt><kbd>w</kbd></dt><dd>Toggle warp mode</dd></div>
         <div><dt><kbd>o</kbd></dt><dd>Toggle the orbital system</dd></div>
+        <div><dt><kbd>c</kbd></dt><dd>Toggle comet streaks</dd></div>
         <div><dt><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd></dt><dd>Mode: Pulse / Route / Forge</dd></div>
         <div><dt><kbd>?</kbd></dt><dd>Toggle this overlay</dd></div>
         <div><dt><kbd>Esc</kbd></dt><dd>Close this overlay</dd></div>
