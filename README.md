@@ -1,6 +1,6 @@
-# AsterForge Observatory 3.1
+# AsterForge Cinderwell 4.0
 
-AsterForge is a live mission-control observatory served by a native C++17 POSIX HTTP server. Zero third-party C++ libraries. The backend forges seeded mission packets, sky layers, orbital systems, and telemetry; the browser renders a flyable WebGL sky.
+AsterForge is a live C++17 foundry served by a native POSIX HTTP server. Zero third-party C++ libraries. The backend forges seeded mission packets, sky layers, orbital systems, and telemetry; the browser renders a molten WebGL well you can orbit or dive into.
 
 ## Highlights
 
@@ -37,7 +37,7 @@ Open `http://localhost:8080`.
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| GET/HEAD | `/api/health` | `status`, `service`, `language`, `version` `3.1.0`, `uptime_seconds`, `request_count` |
+| GET/HEAD | `/api/health` | `status`, `service`, `language`, `version` `4.0.0`, `uptime_seconds`, `request_count` |
 | GET/HEAD | `/api/version` | Version plus endpoint list |
 | GET/HEAD | `/api/presets` | Six named missions |
 | GET/HEAD | `/api/mission` | Query: `seed`, `mode`, `intensity`, `tempo`, `density` |

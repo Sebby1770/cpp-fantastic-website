@@ -100,7 +100,7 @@ public:
         }
 
         if (!cfg_.quiet) {
-            std::cout << "AsterForge Observatory " << kVersion << " at http://localhost:"
+            std::cout << "AsterForge Cinderwell " << kVersion << " at http://localhost:"
                       << cfg_.port << "\n";
             std::cout << "Serving " << cfg_.public_dir << " with " << cfg_.threads
                       << " threads\n";
