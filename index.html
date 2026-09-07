@@ -3,7 +3,13 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>AsterForge Observatory 3.1</title>
+    <title>AsterForge Cinderwell 4.0</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Barlow:wght@450;600;800&family=Cinzel:wght@500;700&display=swap"
+      rel="stylesheet"
+    />
     <link rel="stylesheet" href="./styles.css" />
     <script type="importmap">
       {
@@ -14,31 +20,33 @@
       }
     </script>
   </head>
-  <body>
+  <body data-mode="orbit">
+    <div class="foundry-haze" aria-hidden="true"></div>
+    <div class="spark-field" aria-hidden="true"></div>
     <main class="app-shell">
-      <aside class="command-rail" aria-label="AsterForge controls">
+      <aside class="command-rail" aria-label="Cinderwell kiln controls">
         <div class="brand-lockup">
           <span class="brand-mark" aria-hidden="true"></span>
           <div>
-            <p class="eyebrow">Native C++17 · v3.2 · star glider</p>
+            <p class="eyebrow">Native C++17 · v4.0 · cinderwell</p>
             <h1>AsterForge</h1>
           </div>
         </div>
 
         <section class="panel status-panel">
           <div>
-            <p class="eyebrow">Server</p>
-            <h2>Live Observatory</h2>
+            <p class="eyebrow">Kiln</p>
+            <h2>Live well</h2>
           </div>
           <span id="serverStatus" class="status-pill">checking</span>
         </section>
 
         <section class="panel">
           <div class="panel-heading">
-            <h2>Mode</h2>
+            <h2>Heat</h2>
             <span id="modeBadge">Orbit</span>
           </div>
-          <div class="segmented modes-6" role="group" aria-label="Mode">
+          <div class="segmented modes-6" role="group" aria-label="Kiln mode">
             <button class="mode-button active" data-mode="orbit" type="button">Orbit</button>
             <button class="mode-button" data-mode="bloom" type="button">Bloom</button>
             <button class="mode-button" data-mode="forge" type="button">Forge</button>
@@ -50,7 +58,7 @@
 
         <section class="panel">
           <div class="panel-heading">
-            <h2>Presets</h2>
+            <h2>Ingots</h2>
             <span id="presetsStatus">loading</span>
           </div>
           <div id="presetsList" class="preset-list"></div>
@@ -58,7 +66,7 @@
 
         <section class="panel">
           <div class="panel-heading">
-            <h2>Signal</h2>
+            <h2>Bellows</h2>
             <button
               id="randomizeSeed"
               class="icon-button"
@@ -83,29 +91,29 @@
             <input id="seedInput" type="text" value="sebby" maxlength="28" autocomplete="off" />
           </label>
           <label class="field">
-            <span>Intensity <output id="intensityValue">68</output></span>
+            <span>Heat <output id="intensityValue">68</output></span>
             <input id="intensityInput" type="range" min="1" max="100" value="68" />
           </label>
           <label class="field">
-            <span>Tempo <output id="tempoValue">54</output></span>
+            <span>Hammer <output id="tempoValue">54</output></span>
             <input id="tempoInput" type="range" min="1" max="100" value="54" />
           </label>
           <label class="field">
-            <span>Density <output id="densityValue">72</output></span>
+            <span>Ore <output id="densityValue">72</output></span>
             <input id="densityInput" type="range" min="1" max="100" value="72" />
           </label>
           <div class="toggles">
             <label class="toggle-row">
               <input id="gridToggle" type="checkbox" checked />
-              <span>Grid</span>
+              <span>Grate</span>
             </label>
             <label class="toggle-row">
               <input id="trailToggle" type="checkbox" checked />
-              <span>Trails</span>
+              <span>Sparks</span>
             </label>
             <label class="toggle-row">
               <input id="motionToggle" type="checkbox" checked />
-              <span>Motion</span>
+              <span>Breath</span>
             </label>
             <label class="toggle-row">
               <input id="orbitToggle" type="checkbox" />
@@ -122,13 +130,13 @@
               <path d="M12 2l1.75 6.25L20 10l-6.25 1.75L12 18l-1.75-6.25L4 10l6.25-1.75L12 2z"></path>
               <path d="M19 15l.7 2.3L22 18l-2.3.7L19 21l-.7-2.3L16 18l2.3-.7L19 15z"></path>
             </svg>
-            Generate
+            Strike the well
           </button>
         </section>
 
         <section class="panel palette-panel">
           <div class="panel-heading">
-            <h2>Palette</h2>
+            <h2>Slag</h2>
             <span id="paletteName">live</span>
           </div>
           <div id="swatches" class="swatches" aria-label="Generated palette"></div>
@@ -136,19 +144,20 @@
 
         <section class="panel snapshot-panel">
           <div class="panel-heading">
-            <h2>Snapshots</h2>
+            <h2>Casts</h2>
             <button id="saveSnapshot" class="text-button" type="button">Save</button>
           </div>
           <div id="snapshotList" class="snapshot-list"></div>
         </section>
       </aside>
 
-      <section class="stage" aria-label="Interactive constellation workspace">
-        <canvas id="skyCanvas" aria-label="Generated mission constellation"></canvas>
+      <section class="stage" aria-label="Cinderwell foundry">
+        <canvas id="skyCanvas" aria-label="Molten constellation well"></canvas>
         <div class="hud-frame" aria-hidden="true"></div>
+        <div class="kiln-ring" aria-hidden="true"></div>
         <div class="stage-topbar">
           <div>
-            <p class="eyebrow" id="weatherLabel">Mission</p>
+            <p class="eyebrow" id="weatherLabel">Cast</p>
             <h2 id="missionName">Loading</h2>
           </div>
           <div class="stage-actions">
@@ -160,36 +169,36 @@
         </div>
         <div id="metricStrip" class="metric-strip" aria-label="Live metrics"></div>
         <div id="telemetryStrip" class="telemetry-strip">
-          <span>TELEMETRY</span>
+          <span>QUENCH LOG</span>
           <strong id="telRequests">req 0</strong>
           <strong id="telP99">p99 —</strong>
           <strong id="tel2xx">2xx 0</strong>
           <strong id="tel4xx">4xx 0</strong>
           <strong id="tel5xx">5xx 0</strong>
         </div>
-        <p id="signature" class="signature">waiting for signal</p>
+        <p id="signature" class="signature">waiting for ore</p>
       </section>
 
-      <aside class="intel-panel" aria-label="Generated mission details">
+      <aside class="intel-panel" aria-label="Crystal plaque">
         <section class="panel hero-panel">
-          <p class="eyebrow">Signal</p>
-          <h2 id="missionTagline">Preparing the launch board.</h2>
+          <p class="eyebrow">Ore</p>
+          <h2 id="missionTagline">The well is cold. Strike it.</h2>
           <p id="updatedAt" class="muted">Waiting for C++ response</p>
         </section>
 
         <section class="panel">
           <div class="panel-heading">
-            <h2>Node Intel</h2>
-            <span id="selectedNodeLabel">click a node</span>
+            <h2>Crystal</h2>
+            <span id="selectedNodeLabel">click a crystal</span>
           </div>
           <div id="nodeIntel" class="node-intel">
-            <p class="empty-state">Select a star in the observatory to inspect energy, phase, and kind.</p>
+            <p class="empty-state">Pick a crystal hanging over the lava. Energy, phase, and kind stamp here.</p>
           </div>
         </section>
 
         <section class="panel">
           <div class="panel-heading">
-            <h2>Priority Stack</h2>
+            <h2>Heat stack</h2>
             <span id="nodeCount">0 nodes</span>
           </div>
           <ol id="priorityList" class="priority-list"></ol>
@@ -197,7 +206,7 @@
 
         <section class="panel">
           <div class="panel-heading">
-            <h2>Waypoints</h2>
+            <h2>Channels</h2>
             <span id="routeCount">0 routes</span>
           </div>
           <div id="waypoints" class="waypoints"></div>
@@ -205,7 +214,7 @@
 
         <section class="panel">
           <div class="panel-heading">
-            <h2>Build Notes</h2>
+            <h2>Quench notes</h2>
             <span>fresh</span>
           </div>
           <div id="notesList" class="notes-list"></div>
@@ -216,17 +225,16 @@
     <div id="helpOverlay" class="help-overlay" hidden>
       <div class="help-card" role="dialog" aria-labelledby="helpTitle">
         <div class="panel-heading">
-          <h2 id="helpTitle">Observatory keys</h2>
+          <h2 id="helpTitle">Cinderwell keys</h2>
           <button id="closeHelp" class="text-button" type="button">Close</button>
         </div>
         <ul class="help-list">
           <li><kbd>?</kbd> Toggle this help</li>
-          <li><kbd>G</kbd> Generate mission</li>
+          <li><kbd>G</kbd> Strike the well</li>
           <li><kbd>R</kbd> Randomize seed</li>
-          <li><kbd>1</kbd>–<kbd>6</kbd> Modes: orbit bloom forge night pulse drift</li>
-          <li>Drag to orbit · wheel to dolly · <kbd>F</kbd> pilot (WASD / QE)</li>
-          <li>Click a star for intel · PNG captures the live buffer</li>
-          <li>PNG captures the live WebGL buffer</li>
+          <li><kbd>1</kbd>–<kbd>6</kbd> Heat: orbit bloom forge night pulse drift</li>
+          <li>Drag to orbit · wheel to dolly · <kbd>F</kbd> dive (WASD / QE)</li>
+          <li>Click a crystal for its plaque · PNG captures the live well</li>
         </ul>
       </div>
     </div>

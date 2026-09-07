@@ -10,13 +10,31 @@ const FALLBACK_PRESETS = [
   { id: "drift", label: "Drift", description: "Slow lateral wander with sparse luminous fields.", seed: "drift-field", intensity: 38, tempo: 22, density: 54 },
 ];
 const PALETTES = [
-  { id: "emberglass", colors: ["#080908", "#f7f0df", "#10b8a6", "#ef5e4d", "#f2b544", "#8c6cf5", "#77c66e"] },
-  { id: "tidewire", colors: ["#071013", "#edf7f2", "#1f8fb3", "#ff6b57", "#d9b847", "#4bbf83", "#d46fb0"] },
-  { id: "citrus-noir", colors: ["#0b0b10", "#fff4ce", "#95d839", "#ff5d35", "#49a7ff", "#b877ff", "#f1c232"] },
-  { id: "violet-oxide", colors: ["#100c13", "#f3efe7", "#b888ff", "#d85f7d", "#43c6a8", "#f0aa3b", "#6ea8fe"] },
-  { id: "nova-pulse", colors: ["#12060c", "#f6e6ef", "#ff3d81", "#39d0ff", "#ffe16a", "#b388ff", "#4dffc0"] },
+  { id: "cinderwell", colors: ["#0a0604", "#f4e6d0", "#ff6a22", "#c0392b", "#e0b04a", "#8c4a1a", "#77c66e"] },
+  { id: "slag-gold", colors: ["#120805", "#f7ecd4", "#e0b04a", "#ff5d35", "#ff8a30", "#6aa7c8", "#d46fb0"] },
+  { id: "quench-blue", colors: ["#0b0b10", "#fff4ce", "#6aa7c8", "#ff5d35", "#e0b04a", "#b877ff", "#f1c232"] },
+  { id: "violet-oxide", colors: ["#100c13", "#f3efe7", "#a56bff", "#d85f7d", "#ff6a22", "#f0aa3b", "#6ea8fe"] },
+  { id: "pulse-hammer", colors: ["#12060c", "#f6e6ef", "#ff3b0a", "#ff8a30", "#ffe16a", "#b388ff", "#4dffc0"] },
   { id: "driftwood", colors: ["#0a1014", "#e4eef2", "#6aa7c8", "#c48b5a", "#9ad0b1", "#7a8cff", "#d2c4a8"] },
 ];
+
+const MODE_LAVA = {
+  orbit: 0x7a1a08,
+  bloom: 0xc9a227,
+  forge: 0xff3b0a,
+  night: 0x1a2840,
+  pulse: 0xff5a1f,
+  drift: 0x5a2a6a,
+};
+
+const MODE_EMBER = {
+  orbit: 0xff6a22,
+  bloom: 0xffe7a0,
+  forge: 0xff3b0a,
+  night: 0x6aa7c8,
+  pulse: 0xff8a30,
+  drift: 0xa56bff,
+};
 
 const state = {
   mode: "orbit",
@@ -139,6 +157,7 @@ function currentConfig() {
 function setMode(mode) {
   state.mode = MODES.includes(mode) ? mode : "orbit";
   elements.modeBadge.textContent = modeTitle(state.mode);
+  document.body.dataset.mode = state.mode;
   document.querySelectorAll(".mode-button").forEach((button) => {
     button.classList.toggle("active", button.dataset.mode === state.mode);
   });
@@ -327,7 +346,7 @@ function localMission(config) {
     density,
     updatedAt: new Date().toISOString(),
     missionName: `${pick(rng, prefixes)} ${pick(rng, nouns)}`,
-    tagline: "A local observatory packet generated without the C++ server.",
+    tagline: "A local well packet generated without the C++ kiln.",
     weather: pick(rng, weather),
     metrics: [
       { label: "Velocity", value: metric(44 + intensity / 2), unit: "%" },
@@ -349,7 +368,7 @@ function localMission(config) {
       score: metric(42 + i * 7),
     })),
     notes: [
-      "Pages fallback is active; JSON shapes still match the live observatory.",
+      "Pages fallback is active; JSON shapes still match the live well.",
       "Drag the sky to orbit. Click a node to inspect it.",
       "Seed, mode, intensity, tempo, and density remain shareable in the URL.",
     ],
@@ -438,9 +457,9 @@ function kindName(kind) {
 function renderNodeIntel(index) {
   const mission = state.mission;
   if (!mission || index < 0 || !mission.nodes[index]) {
-    elements.selectedNodeLabel.textContent = "click a node";
+    elements.selectedNodeLabel.textContent = "click a crystal";
     elements.nodeIntel.replaceChildren(
-      makeText("p", "empty-state", "Select a star in the observatory to inspect energy, phase, and kind."),
+      makeText("p", "empty-state", "Pick a crystal hanging over the lava. Energy, phase, and kind stamp here."),
     );
     return;
   }
@@ -670,7 +689,7 @@ function makeGlowTexture(THREE) {
   return texture;
 }
 
-function hexColor(THREE, value, fallback = "#10b8a6") {
+function hexColor(THREE, value, fallback = "#ff6a22") {
   try {
     return new THREE.Color(value || fallback);
   } catch {
@@ -687,19 +706,19 @@ function createThreeRenderer(THREE, OrbitControls) {
     preserveDrawingBuffer: true,
   });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-  renderer.setClearColor(0x03050a, 1);
+  renderer.setClearColor(0x0a0604, 1);
   renderer.outputColorSpace = THREE.SRGBColorSpace;
 
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(55, 1, 0.1, 200);
-  camera.position.set(0.8, 1.4, 9.5);
+  camera.position.set(0.4, 6.2, 12.4);
 
   const controls = new OrbitControls(camera, canvas);
   controls.enableDamping = true;
   controls.dampingFactor = 0.06;
-  controls.minDistance = 3;
-  controls.maxDistance = 28;
-  controls.target.set(0, 0, 0);
+  controls.minDistance = 4;
+  controls.maxDistance = 32;
+  controls.target.set(0, -1.1, 0);
   controls.autoRotate = true;
   controls.autoRotateSpeed = 0.55;
   const flyKeys = { w: false, a: false, s: false, d: false, q: false, e: false };
@@ -735,7 +754,7 @@ function createThreeRenderer(THREE, OrbitControls) {
   starsGeo.setAttribute("position", new THREE.BufferAttribute(starPos, 3));
   const stars = new THREE.Points(
     starsGeo,
-    new THREE.PointsMaterial({ color: 0xd7e7ff, size: 0.12, transparent: true, opacity: 0.85 }),
+    new THREE.PointsMaterial({ color: 0xffd7b0, size: 0.12, transparent: true, opacity: 0.78 }),
   );
   scene.add(stars);
 
@@ -746,9 +765,96 @@ function createThreeRenderer(THREE, OrbitControls) {
   const orbitGroup = new THREE.Group();
   orbitGroup.visible = false;
   scene.add(orbitGroup);
-  const grid = new THREE.GridHelper(16, 24, 0x1b8f86, 0x14202a);
+  const grid = new THREE.GridHelper(16, 24, 0x8c4a1a, 0x2a1610);
   grid.position.y = -4.2;
   scene.add(grid);
+
+  const foundry = new THREE.Group();
+  scene.add(foundry);
+  const lavaMat = new THREE.MeshBasicMaterial({
+    color: MODE_LAVA.orbit,
+    transparent: true,
+    opacity: 0.92,
+    side: THREE.DoubleSide,
+  });
+  const lava = new THREE.Mesh(new THREE.CircleGeometry(9.4, 72), lavaMat);
+  lava.rotation.x = -Math.PI / 2;
+  lava.position.y = -4.36;
+  foundry.add(lava);
+  const lavaHeart = new THREE.Mesh(
+    new THREE.CircleGeometry(4.6, 48),
+    new THREE.MeshBasicMaterial({
+      color: 0xff6a22,
+      transparent: true,
+      opacity: 0.42,
+      side: THREE.DoubleSide,
+    }),
+  );
+  lavaHeart.rotation.x = -Math.PI / 2;
+  lavaHeart.position.y = -4.32;
+  foundry.add(lavaHeart);
+  const rim = new THREE.Mesh(
+    new THREE.TorusGeometry(9.5, 0.32, 10, 80),
+    new THREE.MeshBasicMaterial({ color: 0x2a1610 }),
+  );
+  rim.rotation.x = Math.PI / 2;
+  rim.position.y = -4.18;
+  foundry.add(rim);
+  const brassRing = new THREE.Mesh(
+    new THREE.TorusGeometry(6.1, 0.07, 8, 80),
+    new THREE.MeshBasicMaterial({ color: 0xc9a227 }),
+  );
+  brassRing.rotation.x = Math.PI / 2;
+  brassRing.position.y = -4.12;
+  foundry.add(brassRing);
+  for (let i = 0; i < 8; i += 1) {
+    const angle = (i / 8) * Math.PI * 2;
+    const x = Math.cos(angle) * 8.7;
+    const z = Math.sin(angle) * 8.7;
+    const rod = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.035, 0.045, 11.2, 6),
+      new THREE.MeshBasicMaterial({ color: 0x3a2418 }),
+    );
+    rod.position.set(x, 1.4, z);
+    foundry.add(rod);
+    const lamp = new THREE.Mesh(
+      new THREE.BoxGeometry(1.55, 0.09, 0.2),
+      new THREE.MeshBasicMaterial({ color: 0xff7a2a }),
+    );
+    lamp.position.set(x, 6.4, z);
+    lamp.lookAt(0, 6.4, 0);
+    lamp.userData.lamp = true;
+    foundry.add(lamp);
+    const anvil = new THREE.Mesh(
+      new THREE.BoxGeometry(0.7, 0.28, 0.46),
+      new THREE.MeshBasicMaterial({ color: 0x1a100c }),
+    );
+    anvil.position.set(Math.cos(angle) * 10.4, -4.05, Math.sin(angle) * 10.4);
+    foundry.add(anvil);
+  }
+  const emberCount = 320;
+  const emberPos = new Float32Array(emberCount * 3);
+  const emberLife = new Float32Array(emberCount);
+  for (let i = 0; i < emberCount; i += 1) {
+    const angle = Math.random() * Math.PI * 2;
+    const radius = Math.random() * 8.4;
+    emberPos[i * 3] = Math.cos(angle) * radius;
+    emberPos[i * 3 + 1] = -4.05 + Math.random() * 7.5;
+    emberPos[i * 3 + 2] = Math.sin(angle) * radius;
+    emberLife[i] = Math.random();
+  }
+  const emberGeo = new THREE.BufferGeometry();
+  emberGeo.setAttribute("position", new THREE.BufferAttribute(emberPos, 3));
+  const emberMat = new THREE.PointsMaterial({
+    color: MODE_EMBER.orbit,
+    size: 0.085,
+    transparent: true,
+    opacity: 0.88,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+  });
+  const embers = new THREE.Points(emberGeo, emberMat);
+  foundry.add(embers);
 
   const raycaster = new THREE.Raycaster();
   const pointer = new THREE.Vector2();
@@ -962,6 +1068,33 @@ function createThreeRenderer(THREE, OrbitControls) {
         });
       }
     });
+    lavaMat.color.setHex(MODE_LAVA[state.mode] || MODE_LAVA.orbit);
+    emberMat.color.setHex(MODE_EMBER[state.mode] || MODE_EMBER.orbit);
+    const lavaPulse = 0.34 + Math.sin(state.time * 2.2) * 0.08;
+    lavaHeart.material.opacity = lavaPulse;
+    lavaHeart.scale.setScalar(1 + Math.sin(state.time * 1.6) * 0.04);
+    foundry.children.forEach((child) => {
+      if (child.userData && child.userData.lamp) {
+        child.material.color.setHex(MODE_EMBER[state.mode] || MODE_EMBER.orbit);
+      }
+    });
+    if (moving) {
+      const emberPositions = emberGeo.getAttribute("position");
+      for (let i = 0; i < emberCount; i += 1) {
+        emberLife[i] += 0.004 + Number(elements.tempo.value) / 18000;
+        const y = emberPositions.getY(i) + 0.018 + Number(elements.intensity.value) / 9000;
+        if (y > 4.8 || emberLife[i] > 1) {
+          const angle = Math.random() * Math.PI * 2;
+          const radius = Math.random() * 8.2;
+          emberPositions.setXYZ(i, Math.cos(angle) * radius, -4.05, Math.sin(angle) * radius);
+          emberLife[i] = 0;
+        } else {
+          emberPositions.setY(i, y);
+        }
+      }
+      emberPositions.needsUpdate = true;
+    }
+    renderer.setClearColor(state.mode === "night" ? 0x070b12 : 0x0a0604, 1);
     controls.autoRotate = moving && !piloting;
     if (piloting) {
       camera.getWorldDirection(flyDir);
