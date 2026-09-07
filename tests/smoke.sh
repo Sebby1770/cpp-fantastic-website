@@ -55,7 +55,7 @@ check() {
 }
 
 check "$BASE/" "AsterForge"
-check "$BASE/api/health" '"version":"3.1.0"'
+check "$BASE/api/health" '"version":"3.2.0"'
 check "$BASE/api/version" '"/api/stream"'
 check "$BASE/api/presets" '"presets"'
 check "$BASE/api/presets" '"pulse"'

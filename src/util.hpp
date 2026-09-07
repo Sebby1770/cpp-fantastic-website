@@ -18,7 +18,7 @@
 
 namespace aster {
 
-inline constexpr const char* kVersion = "3.1.0";
+inline constexpr const char* kVersion = "3.2.0";
 inline constexpr const char* kService = "AsterForge";
 inline constexpr const char* kLanguage = "C++17";
 
