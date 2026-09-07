@@ -702,6 +702,23 @@ function createThreeRenderer(THREE, OrbitControls) {
   controls.target.set(0, 0, 0);
   controls.autoRotate = true;
   controls.autoRotateSpeed = 0.55;
+  const flyKeys = { w: false, a: false, s: false, d: false, q: false, e: false };
+  let piloting = false;
+  const flyDir = new THREE.Vector3();
+  const flyRight = new THREE.Vector3();
+  window.addEventListener("keydown", (event) => {
+    const key = event.key.toLowerCase();
+    if (key in flyKeys) flyKeys[key] = true;
+    if (key === "f") {
+      piloting = !piloting;
+      controls.enabled = !piloting;
+      canvas.style.cursor = piloting ? "crosshair" : "grab";
+    }
+  });
+  window.addEventListener("keyup", (event) => {
+    const key = event.key.toLowerCase();
+    if (key in flyKeys) flyKeys[key] = false;
+  });
 
   const glow = makeGlowTexture(THREE);
   const starsGeo = new THREE.BufferGeometry();
@@ -945,7 +962,19 @@ function createThreeRenderer(THREE, OrbitControls) {
         });
       }
     });
-    controls.autoRotate = moving;
+    controls.autoRotate = moving && !piloting;
+    if (piloting) {
+      camera.getWorldDirection(flyDir);
+      flyRight.crossVectors(flyDir, camera.up).normalize();
+      const speed = (0.12 + Number(elements.tempo.value) / 400) * state.timeScale;
+      if (flyKeys.w) camera.position.addScaledVector(flyDir, speed);
+      if (flyKeys.s) camera.position.addScaledVector(flyDir, -speed);
+      if (flyKeys.d) camera.position.addScaledVector(flyRight, speed);
+      if (flyKeys.a) camera.position.addScaledVector(flyRight, -speed);
+      if (flyKeys.e) camera.position.y += speed;
+      if (flyKeys.q) camera.position.y -= speed;
+      controls.target.copy(camera.position).addScaledVector(flyDir, 6);
+    }
     renderer.render(scene, camera);
     raf = requestAnimationFrame(tick);
   }

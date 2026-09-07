@@ -822,6 +822,38 @@ kbd {
   }
 }
 
+/* Cockpit: sky is the page, rails float like glass instruments. */
+.app-shell {
+  display: block;
+  min-height: 100vh;
+}
+.stage {
+  position: fixed;
+  inset: 0;
+  border: 0;
+  border-radius: 0;
+}
+.command-rail,
+.intel-panel {
+  position: fixed;
+  top: 14px;
+  bottom: 14px;
+  width: min(300px, 28vw);
+  z-index: 5;
+  overflow: auto;
+  background: rgba(6, 10, 16, 0.72);
+  backdrop-filter: blur(18px);
+  border: 1px solid rgba(16, 184, 166, 0.28);
+  border-radius: 16px;
+  padding: 10px;
+}
+.command-rail { left: 14px; }
+.intel-panel { right: 14px; }
+.stage-topbar {
+  left: calc(min(300px, 28vw) + 28px);
+  right: calc(min(300px, 28vw) + 28px);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .mode-button,
   .primary-action,
