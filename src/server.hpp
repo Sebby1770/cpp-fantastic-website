@@ -9,603 +9,54 @@
 #include "thread_pool.hpp"
 #include "util.hpp"
 
-#include <algorithm>
+#include <arpa/inet.h>
 #include <atomic>
 #include <chrono>
-#include <filesystem>
+#include <cstring>
+#include <fstream>
 #include <iostream>
-#include <optional>
-#include <random>
-#include <string>
-#include <thread>
-#include <vector>
-
-#include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
+#include <sstream>
 #include <sys/socket.h>
-#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <vector>
 
 namespace aster {
 
-namespace fs = std::filesystem;
+inline std::atomic<bool> g_running{true};
 
-inline unsigned default_thread_count() {
-    return std::clamp(std::max(2u, std::thread::hardware_concurrency()), 2u, 32u);
-}
+inline void request_stop() { g_running.store(false); }
 
-struct CliOptions {
+struct ServerConfig {
     int port = 8080;
+    int threads = 4;
+    std::size_t max_body = 1024 * 1024;
+    int rate_limit = 50;
+    std::string log_format = "json";
     bool quiet = false;
-    unsigned threads = default_thread_count();
-    std::size_t max_body = kMaxBodyBytes;
-    double rate_limit = 50.0;  // sustained requests/sec per IP; 0 disables
-    LogFormat log_format = LogFormat::Json;
+    fs::path public_dir;
+    int max_sse = 16;
 };
 
-// Resolve a request path to a file inside public_dir, or nullopt when the
-// path escapes the public root (traversal, symlink escape) or is otherwise
-// unusable. Pure-ish (touches the filesystem read-only) so it is unit-testable.
-inline std::optional<fs::path> resolve_static_path(const fs::path& public_dir,
-                                                   const std::string& request_path) {
-    if (request_path.find("..") != std::string::npos ||
-        request_path.find('\0') != std::string::npos) {
-        return std::nullopt;
-    }
-
-    std::string relative = request_path == "/" ? "/index.html" : request_path;
-    while (!relative.empty() && relative.front() == '/') {
-        relative.erase(relative.begin());
-    }
-    if (relative.empty()) {
-        relative = "index.html";
-    }
-
+inline fs::path find_public_dir(const char* argv0) {
     std::error_code ec;
-    fs::path candidate = fs::weakly_canonical(public_dir / relative, ec);
-    if (ec) {
-        return std::nullopt;
-    }
-    if (fs::is_directory(candidate)) {
-        candidate = fs::weakly_canonical(candidate / "index.html", ec);
-        if (ec) {
-            return std::nullopt;
-        }
-    }
-
-    const fs::path root = fs::weakly_canonical(public_dir, ec);
-    if (ec) {
-        return std::nullopt;
-    }
-    const std::string root_str = root.generic_string();
-    const std::string candidate_str = candidate.generic_string();
-    if (candidate_str != root_str &&
-        candidate_str.compare(0, root_str.size() + 1, root_str + "/") != 0) {
-        return std::nullopt;
-    }
-    return candidate;
-}
-
-class Server {
-public:
-    Server(const CliOptions& options, fs::path public_dir)
-        : port_(options.port),
-          public_dir_(std::move(public_dir)),
-          quiet_(options.quiet),
-          log_format_(options.log_format),
-          max_body_(options.max_body),
-          rate_limit_(options.rate_limit),
-          limiter_(options.rate_limit * 2.0, options.rate_limit),
-          pool_(options.threads) {}
-
-    int run(std::atomic<bool>& running) {
-        running_ = &running;
-        const int server_fd = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (server_fd < 0) {
-            std::cerr << "Could not create socket\n";
-            return 1;
-        }
-
-        int opt = 1;
-        ::setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-        sockaddr_in address{};
-        address.sin_family = AF_INET;
-        address.sin_addr.s_addr = INADDR_ANY;
-        address.sin_port = htons(static_cast<uint16_t>(port_));
-
-        if (::bind(server_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0) {
-            std::cerr << "Could not bind to port " << port_ << "\n";
-            ::close(server_fd);
-            return 1;
-        }
-
-        if (::listen(server_fd, 64) < 0) {
-            std::cerr << "Could not listen on port " << port_ << "\n";
-            ::close(server_fd);
-            return 1;
-        }
-
-        std::cout << "AsterForge " << kVersion << " running at http://localhost:" << port_ << "\n";
-        std::cout << "Serving " << public_dir_ << "\n";
-        if (quiet_) {
-            std::cout << "Request logging disabled (--quiet)\n";
-        }
-
-        while (running.load()) {
-            pollfd listen_poll{};
-            listen_poll.fd = server_fd;
-            listen_poll.events = POLLIN;
-            const int ready = ::poll(&listen_poll, 1, 250);
-            if (ready <= 0) {
-                // Timeout or EINTR: re-check the running flag.
-                continue;
-            }
-
-            sockaddr_in client_address{};
-            socklen_t client_len = sizeof(client_address);
-            const int client_fd =
-                ::accept(server_fd, reinterpret_cast<sockaddr*>(&client_address), &client_len);
-            if (client_fd < 0) {
-                if (running.load()) {
-                    std::cerr << "Accept failed\n";
-                }
-                continue;
-            }
-
-            timeval recv_timeout{};
-            recv_timeout.tv_sec = 5;
-            ::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
-            timeval send_timeout{};
-            send_timeout.tv_sec = 10;
-            ::setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
-
-            char ip_buffer[INET_ADDRSTRLEN] = "unknown";
-            ::inet_ntop(AF_INET, &client_address.sin_addr, ip_buffer, sizeof(ip_buffer));
-            std::string client_ip(ip_buffer);
-
-            pool_.submit([this, client_fd, client_ip = std::move(client_ip)] {
-                handle_client(client_fd, client_ip);
-            });
-        }
-
-        ::close(server_fd);
-        pool_.shutdown();
-        // SSE threads are detached; they notice `running` within 250 ms and
-        // release the hub after their last touch of shared state. Wait briefly
-        // so shutdown stays clean without being hostage to a blocked send.
-        for (int i = 0; i < 60 && stream_hub_.active() > 0; ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(25));
-        }
-        std::cout << "AsterForge shutting down...\n";
-        return 0;
-    }
-
-private:
-    void handle_client(int client_fd, const std::string& client_ip) {
-        std::string leftover;
-        for (int served = 0; served < kMaxRequestsPerConn; ++served) {
-            Request request;
-            const ReadResult result = read_http_request(client_fd, request, leftover, max_body_);
-            if (result == ReadResult::Closed) {
-                // Clean close or idle keep-alive expiry: nothing to answer.
-                break;
-            }
-            if (result == ReadResult::Timeout) {
-                // A partial request stalled past its deadline (slow-drip client):
-                // answer 408 and drop the connection to free the pool worker.
-                Response timeout_response = simple_status(408);
-                timeout_response.extra_headers.emplace_back("Cache-Control", "no-store");
-                send_response(client_fd, std::move(timeout_response), false);
-                break;
-            }
-
-            const auto started = std::chrono::steady_clock::now();
-            Response response;
-            bool keep_alive = false;
-            if (result == ReadResult::Ok) {
-                if (rate_limit_ > 0.0 && !limiter_.allow(client_ip, started)) {
-                    response = json_response("{\"error\":\"rate_limited\"}", 429,
-                                             status_text_for(429));
-                    response.extra_headers.emplace_back("Retry-After", "1");
-                    response.extra_headers.emplace_back("Cache-Control", "no-store");
-                } else if (request.method == "GET" && request.path == "/api/stream") {
-                    // Long-lived SSE stream: hand the fd to a detached thread so
-                    // it never occupies a pool worker; keep-alive is bypassed.
-                    handle_stream(client_fd, client_ip, request, started);
-                    return;
-                } else {
-                    response = route(request);
-                    const auto connection = request.headers.find("connection");
-                    keep_alive = wants_keep_alive(
-                        request.version,
-                        connection == request.headers.end() ? "" : connection->second);
-                }
-            } else if (result == ReadResult::Malformed) {
-                response = bad_request("400 Bad Request: malformed HTTP request.");
-            } else if (result == ReadResult::HeadersTooLarge) {
-                response = simple_status(431);
-            } else {  // ReadResult::BodyTooLarge
-                response = simple_status(413);
-            }
-
-            if (response.status >= 400 || served + 1 == kMaxRequestsPerConn ||
-                !running_->load()) {
-                keep_alive = false;
-            }
-            if (request.method == "HEAD") {
-                response.include_body = false;
-            }
-            const auto latency = std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - started);
-
-            metrics_.record(request.path.empty() ? "/" : request.path, response.status, latency);
-
-            if (!quiet_) {
-                access_log(log_format_, client_ip, request, response.status, response.body.size(),
-                           latency);
-            }
-
-            if (!send_response(client_fd, response, keep_alive) || !keep_alive) {
-                break;
-            }
-        }
-        ::close(client_fd);
-    }
-
-    // Answer GET /api/stream: count the request once at connect, then either
-    // reject with 503 (over the concurrent-stream cap) or detach a thread that
-    // owns the fd for the rest of the connection.
-    void handle_stream(int client_fd, const std::string& client_ip, const Request& request,
-                       std::chrono::steady_clock::time_point started) {
-        const bool acquired = stream_hub_.try_acquire();
-        const int status = acquired ? 200 : 503;
-        const auto latency = std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - started);
-        metrics_.record(request.path, status, latency);
-        if (!quiet_) {
-            access_log(log_format_, client_ip, request, status, 0, latency);
-        }
-        if (!acquired) {
-            Response response = json_response("{\"error\":\"too_many_streams\"}", 503,
-                                              status_text_for(503));
-            response.extra_headers.emplace_back("Cache-Control", "no-store");
-            send_response(client_fd, response, false);
-            ::close(client_fd);
-            return;
-        }
-        Metrics& metrics = metrics_;
-        std::atomic<bool>& running = *running_;
-        StreamHub& hub = stream_hub_;
-        std::thread([client_fd, &metrics, &running, &hub] {
-            run_sse(client_fd, metrics, running, hub);
-        }).detach();
-    }
-
-    Response route(const Request& request) {
-        Response response = dispatch(request);
-        const bool has_cache_control = std::any_of(
-            response.extra_headers.begin(), response.extra_headers.end(),
-            [](const std::pair<std::string, std::string>& header) {
-                return header.first == "Cache-Control";
-            });
-        if (!has_cache_control) {
-            response.extra_headers.emplace_back("Cache-Control", "no-store");
-        }
-        return response;
-    }
-
-    Response dispatch(const Request& request) {
-        const std::string& method = request.method;
-
-        if (method == "OPTIONS") {
-            Response response{204, "No Content", "text/plain; charset=utf-8", "", true, {}};
-            return response;
-        }
-
-        if (method != "GET" && method != "HEAD" && method != "POST") {
-            return method_not_allowed();
-        }
-
-        if (request.path == "/api/health") {
-            if (method == "POST") {
-                return method_not_allowed();
-            }
-            std::ostringstream json;
-            json << "{";
-            json << "\"status\":\"ok\",";
-            json << "\"service\":\"AsterForge\",";
-            json << "\"language\":\"C++17\",";
-            json << "\"version\":\"" << kVersion << "\",";
-            json << "\"uptime_seconds\":" << metrics_.uptime_seconds() << ",";
-            json << "\"request_count\":" << metrics_.total_requests();
-            json << "}";
-            return json_response(json.str());
-        }
-
-        if (request.path == "/api/mission") {
-            if (method == "POST") {
-                return method_not_allowed();
-            }
-            return json_response(build_mission_json(request.query));
-        }
-
-        if (request.path == "/api/palettes") {
-            if (method == "POST") {
-                return method_not_allowed();
-            }
-            return json_response(build_palettes_json());
-        }
-
-        if (request.path == "/api/constellation") {
-            if (method == "POST") {
-                return method_not_allowed();
-            }
-            return json_response(build_constellation_json(request.query));
-        }
-
-        if (request.path == "/api/sky") {
-            if (method == "POST") {
-                return method_not_allowed();
-            }
-            return json_response(build_sky_json(request.query));
-        }
-
-        if (request.path == "/api/orbit") {
-            if (method == "POST") {
-                return method_not_allowed();
-            }
-            return json_response(build_orbit_json(request.query));
-        }
-
-        if (request.path == "/api/comet") {
-            if (method == "POST") {
-                return method_not_allowed();
-            }
-            return json_response(build_comet_json(request.query));
-        }
-
-        if (request.path == "/api/metrics") {
-            if (method == "POST") {
-                return method_not_allowed();
-            }
-            return json_response(metrics_.to_json());
-        }
-
-        if (request.path == "/api/echo") {
-            if (method == "GET") {
-                return method_not_allowed();
-            }
-            if (method == "POST" || method == "HEAD") {
-                std::ostringstream json;
-                json << "{";
-                json << "\"echoed\":true,";
-                json << "\"bytes\":" << request.body.size() << ",";
-                json << "\"contentType\":\""
-                     << json_escape(request.headers.count("content-type")
-                                        ? request.headers.at("content-type")
-                                        : "")
-                     << "\",";
-                // Echo body as a JSON string (escaped), so clients always get valid JSON.
-                json << "\"body\":\"" << json_escape(request.body) << "\"";
-                json << "}";
-                return json_response(json.str());
-            }
-        }
-
-        if (request.path == "/api/version") {
-            if (method == "POST") {
-                return method_not_allowed();
-            }
-            std::ostringstream json;
-            json << "{";
-            json << "\"service\":\"AsterForge\",";
-            json << "\"version\":\"" << kVersion << "\",";
-            json << "\"language\":\"C++17\",";
-            json << "\"endpoints\":[\"/api/health\",\"/api/version\",\"/api/time\",\"/api/random\","
-                    "\"/api/status\",\"/api/mission\",\"/api/palettes\",\"/api/constellation\","
-                    "\"/api/sky\",\"/api/orbit\",\"/api/comet\",\"/api/metrics\",\"/api/stream\","
-                    "\"/api/echo\"]";
-            json << "}";
-            return json_response(json.str());
-        }
-
-        if (request.path == "/api/time") {
-            if (method == "POST") {
-                return method_not_allowed();
-            }
-            const auto now = std::chrono::system_clock::now();
-            const auto unix_s =
-                std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
-            std::ostringstream json;
-            json << "{";
-            json << "\"iso\":\"" << current_time_iso() << "\",";
-            json << "\"unix\":" << unix_s;
-            json << "}";
-            return json_response(json.str());
-        }
-
-        if (request.path == "/api/random") {
-            if (method == "POST") {
-                return method_not_allowed();
-            }
-            const int lo = int_param(request.query, "min", 0, -1000000, 1000000);
-            const int hi = int_param(request.query, "max", 100, -1000000, 1000000);
-            const int min_v = std::min(lo, hi);
-            const int max_v = std::max(lo, hi);
-            const std::string seed = string_param(request.query, "seed", "aster", 64);
-            std::mt19937 rng(stable_seed(seed + ":" + std::to_string(min_v) + ":" +
-                                         std::to_string(max_v)));
-            std::uniform_int_distribution<int> dist(min_v, max_v);
-            const int value = dist(rng);
-            std::ostringstream json;
-            json << "{";
-            json << "\"seed\":\"" << json_escape(seed) << "\",";
-            json << "\"min\":" << min_v << ",";
-            json << "\"max\":" << max_v << ",";
-            json << "\"value\":" << value;
-            json << "}";
-            return json_response(json.str());
-        }
-
-        if (request.path == "/api/status") {
-            if (method == "POST") {
-                return method_not_allowed();
-            }
-            std::ostringstream json;
-            json << "{";
-            json << "\"status\":\"ok\",";
-            json << "\"service\":\"AsterForge\",";
-            json << "\"version\":\"" << kVersion << "\",";
-            json << "\"uptime_seconds\":" << metrics_.uptime_seconds() << ",";
-            json << "\"request_count\":" << metrics_.total_requests() << ",";
-            json << "\"public_dir\":\"" << json_escape(public_dir_.string()) << "\",";
-            json << "\"port\":" << port_;
-            json << "}";
-            return json_response(json.str());
-        }
-
-        if (method == "POST") {
-            return method_not_allowed();
-        }
-
-        // Unknown /api/* routes return a JSON 404 (rather than the HTML/static
-        // 404) so API clients always receive a machine-readable body.
-        if (request.path.rfind("/api/", 0) == 0) {
-            std::ostringstream json;
-            json << "{\"error\":\"not_found\",\"path\":\"" << json_escape(request.path) << "\"}";
-            Response response = json_response(json.str(), 404, status_text_for(404));
-            response.extra_headers.emplace_back("Cache-Control", "no-store");
-            return response;
-        }
-
-        return serve_static(request);
-    }
-
-    Response serve_static(const Request& request) const {
-        const std::string& request_path = request.path;
-        if (request_path.find('\0') != std::string::npos) {
-            return bad_request("Invalid path.");
-        }
-        if (request_path.find("..") != std::string::npos) {
-            return bad_request("Path traversal is not allowed.");
-        }
-
-        const std::optional<fs::path> resolved = resolve_static_path(public_dir_, request_path);
-        if (!resolved) {
-            return not_found();
-        }
-        const fs::path& file_path = *resolved;
-        if (!fs::exists(file_path) || !fs::is_regular_file(file_path)) {
-            return not_found();
-        }
-
-        // Content negotiation: serve a pre-compressed `<file>.gz` sidecar when
-        // the client accepts gzip and one exists. Nothing is compressed at
-        // request time — this stays dependency-free and costs no CPU.
-        bool gzipped = false;
-        fs::path payload_path = file_path;
-        const auto accept_encoding = request.headers.find("accept-encoding");
-        if (accept_encoding != request.headers.end() && accepts_gzip(accept_encoding->second)) {
-            fs::path candidate = file_path;
-            candidate += ".gz";
-            std::error_code gz_ec;
-            if (fs::is_regular_file(candidate, gz_ec)) {
-                payload_path = candidate;
-                gzipped = true;
-            }
-        }
-
-        const std::string body = read_file(payload_path);
-        // The ETag identifies the *representation*, so the gzip and identity
-        // forms must never share one.
-        const std::string etag = "\"" + weak_hash_hex(body) + "-" +
-                                 std::to_string(body.size()) + (gzipped ? "-gz" : "") + "\"";
-        std::error_code ec;
-        const auto mtime = fs::last_write_time(file_path, ec);
-        const std::string last_modified = ec ? std::string{} : http_date(mtime);
-
-        // Conditional requests: If-None-Match wins over If-Modified-Since (RFC 9110).
-        bool not_modified = false;
-        const auto if_none_match = request.headers.find("if-none-match");
-        if (if_none_match != request.headers.end()) {
-            not_modified = if_none_match->second == etag || if_none_match->second == "*";
-        } else {
-            const auto if_modified_since = request.headers.find("if-modified-since");
-            std::time_t since = 0;
-            if (if_modified_since != request.headers.end() && !ec &&
-                parse_http_date(if_modified_since->second, since)) {
-                not_modified = file_time_to_time_t(mtime) <= since;
-            }
-        }
-
-        Response response =
-            not_modified
-                ? Response{304, status_text_for(304), mime_type(file_path), "", true, {}}
-                : Response{200, "OK", mime_type(file_path), body, true, {}};
-
-        // Range requests apply to the selected representation, so `Content-Range`
-        // is measured against the bytes actually being sent (gzip or identity).
-        if (!not_modified) {
-            const auto range_header = request.headers.find("range");
-            if (range_header != request.headers.end()) {
-                ByteRange range;
-                switch (parse_byte_range(range_header->second, body.size(), range)) {
-                    case RangeResult::Ok:
-                        response.status = 206;
-                        response.status_text = status_text_for(206);
-                        response.body = body.substr(range.start, range.length());
-                        response.extra_headers.emplace_back(
-                            "Content-Range", "bytes " + std::to_string(range.start) + "-" +
-                                                 std::to_string(range.end) + "/" +
-                                                 std::to_string(body.size()));
-                        break;
-                    case RangeResult::Unsatisfiable:
-                        response.status = 416;
-                        response.status_text = status_text_for(416);
-                        response.body.clear();
-                        response.extra_headers.emplace_back(
-                            "Content-Range", "bytes */" + std::to_string(body.size()));
-                        break;
-                    case RangeResult::None:
-                        break;  // unsupported form: serve the whole body
-                }
-            }
-        }
-
-        response.extra_headers.emplace_back("Accept-Ranges", "bytes");
-        response.extra_headers.emplace_back("ETag", etag);
-        response.extra_headers.emplace_back("Cache-Control", "public, max-age=300");
-        if (gzipped) {
-            response.extra_headers.emplace_back("Content-Encoding", "gzip");
-        }
-        // Caches must key on Accept-Encoding whenever a .gz sidecar could apply.
-        response.extra_headers.emplace_back("Vary", "Accept-Encoding");
-        if (!last_modified.empty()) {
-            response.extra_headers.emplace_back("Last-Modified", last_modified);
-        }
-        return response;
-    }
-
-    int port_;
-    fs::path public_dir_;
-    bool quiet_;
-    LogFormat log_format_;
-    std::size_t max_body_;
-    double rate_limit_;
-    RateLimiter limiter_;
-    ThreadPool pool_;
-    Metrics metrics_;
-    StreamHub stream_hub_;
-    std::atomic<bool>* running_ = nullptr;
-};
-
-inline fs::path find_public_dir() {
-    const std::vector<fs::path> candidates = {
+    std::vector<fs::path> candidates = {
         fs::current_path() / "public",
         fs::current_path() / ".." / "public",
-        fs::current_path() / ".." / ".." / "public"
+        fs::current_path() / ".." / ".." / "public",
     };
+    if (argv0 && argv0[0] != '\0') {
+        const fs::path exe = fs::absolute(argv0, ec);
+        if (!ec) {
+            const fs::path dir = exe.parent_path();
+            candidates.push_back(dir / "public");
+            candidates.push_back(dir / ".." / "public");
+            candidates.push_back(dir / ".." / ".." / "public");
+        }
+    }
     for (const auto& candidate : candidates) {
         if (fs::exists(candidate / "index.html")) {
             return fs::weakly_canonical(candidate);
@@ -614,31 +65,459 @@ inline fs::path find_public_dir() {
     return fs::current_path() / "public";
 }
 
-inline CliOptions parse_cli(int argc, char** argv) {
-    CliOptions options;
-    for (int i = 1; i < argc; ++i) {
-        const std::string arg = argv[i];
-        if (arg == "--port" && i + 1 < argc) {
-            options.port = std::stoi(argv[++i]);
-        } else if (arg == "--threads" && i + 1 < argc) {
-            options.threads = static_cast<unsigned>(std::clamp(std::stoi(argv[++i]), 2, 32));
-        } else if (arg == "--max-body" && i + 1 < argc) {
-            options.max_body = static_cast<std::size_t>(std::max(1L, std::stol(argv[++i])));
-        } else if (arg == "--rate-limit" && i + 1 < argc) {
-            options.rate_limit = std::max(0.0, std::stod(argv[++i]));
-        } else if (arg == "--log-format" && i + 1 < argc) {
-            options.log_format = log_format_from_string(argv[++i]);
-        } else if (arg == "--quiet" || arg == "-q") {
-            options.quiet = true;
-        } else if (arg == "--help" || arg == "-h") {
-            std::cout << "AsterForge " << kVersion << "\n"
-                      << "Usage: cpp_fantastic_website [--port N] [--threads N] [--max-body BYTES]"
-                      << " [--rate-limit N] [--log-format json|text] [--quiet]\n";
-            std::exit(0);
+class Server {
+public:
+    explicit Server(ServerConfig config)
+        : cfg_(std::move(config)),
+          limiter_(cfg_.rate_limit),
+          log_(cfg_.log_format, cfg_.quiet),
+          hub_(&metrics_, &g_running, cfg_.max_sse),
+          pool_(cfg_.threads, static_cast<std::size_t>(cfg_.threads) * 32),
+          started_(std::chrono::steady_clock::now()) {}
+
+    int run() {
+        UniqueFd listen_fd(::socket(AF_INET, SOCK_STREAM, 0));
+        if (!listen_fd) {
+            std::cerr << "Could not create socket\n";
+            return 1;
+        }
+
+        int opt = 1;
+        setsockopt(listen_fd.get(), SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = INADDR_ANY;
+        address.sin_port = htons(static_cast<std::uint16_t>(cfg_.port));
+
+        if (bind(listen_fd.get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0) {
+            std::cerr << "Could not bind to port " << cfg_.port << "\n";
+            return 1;
+        }
+        if (listen(listen_fd.get(), 128) < 0) {
+            std::cerr << "Could not listen on port " << cfg_.port << "\n";
+            return 1;
+        }
+
+        if (!cfg_.quiet) {
+            std::cout << "AsterForge Observatory " << kVersion << " at http://localhost:"
+                      << cfg_.port << "\n";
+            std::cout << "Serving " << cfg_.public_dir << " with " << cfg_.threads
+                      << " threads\n";
+        }
+
+        hub_.start(started_);
+
+        while (g_running.load()) {
+            pollfd item{};
+            item.fd = listen_fd.get();
+            item.events = POLLIN;
+            const int ready = ::poll(&item, 1, 250);
+            if (ready < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                if (g_running.load()) {
+                    std::cerr << "Poll failed\n";
+                }
+                break;
+            }
+            if (ready == 0 || !(item.revents & POLLIN)) {
+                continue;
+            }
+
+            sockaddr_in client_address{};
+            socklen_t client_len = sizeof(client_address);
+            const int client = accept(listen_fd.get(), reinterpret_cast<sockaddr*>(&client_address),
+                                      &client_len);
+            if (client < 0) {
+                continue;
+            }
+
+            char ip[INET_ADDRSTRLEN] = "0.0.0.0";
+            inet_ntop(AF_INET, &client_address.sin_addr, ip, sizeof(ip));
+            const std::string ip_str = ip;
+
+            if (!pool_.submit([this, client, ip_str] { handle_client(client, ip_str); })) {
+                UniqueFd fd(client);
+                const Request dummy;
+                auto response = service_unavailable();
+                send_all(fd.get(), serialize_response(dummy, response, false));
+            }
+        }
+
+        g_running.store(false);
+        hub_.stop();
+        pool_.stop();
+        return 0;
+    }
+
+private:
+    long long uptime_seconds() const {
+        return std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::steady_clock::now() - started_)
+            .count();
+    }
+
+    void configure_client(int fd) const {
+        const timeval timeout{2, 0};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+        int nodelay = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+    }
+
+    void handle_client(int raw_fd, std::string ip) {
+        UniqueFd fd(raw_fd);
+        configure_client(fd.get());
+
+        std::string buffer;
+        int served = 0;
+        const int max_keepalive = 64;
+        const std::size_t max_headers = 64 * 1024;
+
+        while (g_running.load() && served < max_keepalive) {
+            const bool idle = buffer.empty();
+            while (buffer.find("\r\n\r\n") == std::string::npos && g_running.load()) {
+                if (buffer.size() > max_headers) {
+                    finish(fd.get(), Request{}, headers_too_large(), ip, false);
+                    return;
+                }
+                char chunk[4096];
+                const ssize_t received = ::recv(fd.get(), chunk, sizeof(chunk), 0);
+                if (received < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT) {
+                        if (idle && buffer.empty()) {
+                            return;
+                        }
+                        finish(fd.get(), Request{}, request_timeout(), ip, false);
+                    }
+                    return;
+                }
+                if (received == 0) {
+                    return;
+                }
+                buffer.append(chunk, static_cast<std::size_t>(received));
+            }
+            if (!g_running.load()) {
+                return;
+            }
+
+            const ParseOutcome parsed = try_parse_request(buffer, max_headers, cfg_.max_body);
+            if (parsed.status == ParseStatus::incomplete) {
+                char chunk[4096];
+                const ssize_t received = ::recv(fd.get(), chunk, sizeof(chunk), 0);
+                if (received < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT) {
+                        finish(fd.get(), Request{}, request_timeout(), ip, false);
+                    }
+                    return;
+                }
+                if (received == 0) {
+                    return;
+                }
+                buffer.append(chunk, static_cast<std::size_t>(received));
+                continue;
+            }
+            if (parsed.status == ParseStatus::headers_too_large) {
+                finish(fd.get(), Request{}, headers_too_large(), ip, false);
+                return;
+            }
+            if (parsed.status == ParseStatus::body_too_large) {
+                finish(fd.get(), parsed.request, payload_too_large(), ip, false);
+                return;
+            }
+            if (parsed.status == ParseStatus::bad) {
+                finish(fd.get(), Request{}, bad_request("Malformed request."), ip, false);
+                return;
+            }
+
+            Request request = parsed.request;
+            request.ip = ip;
+            buffer.erase(0, parsed.consumed);
+
+            const auto t0 = std::chrono::steady_clock::now();
+            if (!limiter_.allow(ip)) {
+                const Response limited = too_many_requests();
+                const bool keep = !wants_close(request) && !limited.close;
+                finish(fd.get(), request, limited, ip, keep, t0);
+                if (!keep) {
+                    return;
+                }
+                ++served;
+                continue;
+            }
+
+            Response response;
+            try {
+                response = route(request, fd.get());
+            } catch (...) {
+                response = internal_error();
+            }
+
+            if (response.take_socket) {
+                fd.release();
+                const auto t1 = std::chrono::steady_clock::now();
+                const double ms =
+                    std::chrono::duration<double, std::milli>(t1 - t0).count();
+                metrics_.record(request.path, 200, ms);
+                log_.write(ip, request.method, request.target, 200, 0, ms);
+                return;
+            }
+
+            const bool keep = !wants_close(request) && !response.close && served + 1 < max_keepalive;
+            finish(fd.get(), request, response, ip, keep, t0);
+            if (!keep) {
+                return;
+            }
+            ++served;
         }
     }
-    options.port = std::clamp(options.port, 1024, 65535);
-    return options;
-}
+
+    void finish(int fd, const Request& request, Response response, const std::string& ip,
+                bool keep_alive,
+                std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now()) {
+        if (!keep_alive) {
+            response.close = true;
+        }
+        const std::string payload = serialize_response(request, response, keep_alive);
+        send_all(fd, payload);
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - started)
+                              .count();
+        const std::string path = request.path.empty() ? "-" : request.path;
+        metrics_.record(path, response.status, ms);
+        log_.write(ip, request.method.empty() ? "-" : request.method,
+                   request.target.empty() ? path : request.target, response.status,
+                   response.body.size(), ms);
+    }
+
+    Response route(Request& request, int fd) {
+        if (request.method == "OPTIONS") {
+            return cors_preflight();
+        }
+
+        if (request.path == "/api/echo") {
+            if (request.method != "POST") {
+                return method_not_allowed("POST, OPTIONS");
+            }
+            std::string body = request.body.empty() ? "{}" : request.body;
+            return json_ok(body);
+        }
+
+        if (request.path == "/api/stream") {
+            if (request.method == "HEAD") {
+                Response response;
+                response.content_type = "text/event-stream";
+                response.extra_headers.emplace_back("Cache-Control", "no-store");
+                return response;
+            }
+            if (request.method != "GET") {
+                return method_not_allowed("GET, HEAD, OPTIONS");
+            }
+            return start_stream(fd);
+        }
+
+        const bool read = request.method == "GET" || request.method == "HEAD";
+        if (starts_with(request.path, "/api/")) {
+            if (!read) {
+                return method_not_allowed("GET, HEAD, OPTIONS");
+            }
+            if (request.path == "/api/health") {
+                return json_ok(build_health_json(uptime_seconds(), metrics_.request_count()));
+            }
+            if (request.path == "/api/version") {
+                return json_ok(build_version_json());
+            }
+            if (request.path == "/api/presets") {
+                return json_ok(build_presets_json());
+            }
+            if (request.path == "/api/mission") {
+                return json_ok(build_mission_json(request.query));
+            }
+            if (request.path == "/api/share") {
+                return json_ok(build_share_json(request.query));
+            }
+            if (request.path == "/api/sky") {
+                return json_ok(build_sky_json(request.query));
+            }
+            if (request.path == "/api/orbit") {
+                return json_ok(build_orbit_json(request.query));
+            }
+            if (request.path == "/api/constellation") {
+                return json_ok(build_constellation_json(request.query));
+            }
+            if (request.path == "/api/catalog") {
+                return json_ok(build_catalog_json());
+            }
+            if (request.path == "/api/metrics") {
+                return json_ok(metrics_.to_json());
+            }
+            return not_found();
+        }
+
+        if (!read) {
+            return method_not_allowed("GET, HEAD, OPTIONS");
+        }
+        return serve_static(request);
+    }
+
+    Response start_stream(int fd) {
+        if (!hub_.try_reserve()) {
+            return service_unavailable();
+        }
+        Response headers;
+        headers.content_type = "text/event-stream";
+        headers.extra_headers.emplace_back("Cache-Control", "no-store");
+        headers.extra_headers.emplace_back("X-Accel-Buffering", "no");
+        headers.close = true;
+        Request dummy;
+        dummy.method = "GET";
+        if (!send_all(fd, serialize_response(dummy, headers, false))) {
+            hub_.cancel_reserve();
+            Response failed = internal_error();
+            failed.close = true;
+            return failed;
+        }
+        if (!hub_.attach(fd)) {
+            UniqueFd closer(fd);
+            Response taken;
+            taken.take_socket = true;
+            taken.status = 200;
+            return taken;
+        }
+        Response taken;
+        taken.take_socket = true;
+        taken.status = 200;
+        return taken;
+    }
+
+    Response serve_static(const Request& request) const {
+        if (path_has_dotdot(request.path) || request.path.find('\0') != std::string::npos) {
+            return bad_request("Path traversal is not allowed.");
+        }
+
+        std::string relative = request.path == "/" ? "/index.html" : request.path;
+        while (!relative.empty() && relative.front() == '/') {
+            relative.erase(relative.begin());
+        }
+        if (relative.empty()) {
+            relative = "index.html";
+        }
+
+        fs::path file_path = cfg_.public_dir / relative;
+        if (!path_is_inside(cfg_.public_dir, file_path)) {
+            return bad_request("Path traversal is not allowed.");
+        }
+
+        std::error_code ec;
+        if (fs::is_directory(file_path, ec)) {
+            file_path /= "index.html";
+            if (!path_is_inside(cfg_.public_dir, file_path)) {
+                return bad_request("Path traversal is not allowed.");
+            }
+        }
+
+        struct stat st {};
+        if (::stat(file_path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+            return not_found();
+        }
+
+        const auto file_size = static_cast<std::uint64_t>(st.st_size);
+        const std::time_t mtime = st.st_mtime;
+        const std::string etag = "\"" + hex64(file_size) + "-" +
+                                 hex64(static_cast<std::uint64_t>(mtime)) + "\"";
+        const std::string last_modified = http_date(mtime);
+
+        const std::string inm = header_get(request, "if-none-match");
+        if (!inm.empty()) {
+            if (inm == etag || inm == "*" || inm.find(etag) != std::string::npos) {
+                Response response;
+                response.status = 304;
+                response.status_text = "Not Modified";
+                response.extra_headers.emplace_back("ETag", etag);
+                response.extra_headers.emplace_back("Last-Modified", last_modified);
+                response.extra_headers.emplace_back("Cache-Control", "public, max-age=300");
+                return response;
+            }
+        }
+        const std::string ims = header_get(request, "if-modified-since");
+        if (!ims.empty() && inm.empty()) {
+            std::time_t since = 0;
+            if (parse_http_date(ims, since) && mtime <= since) {
+                Response response;
+                response.status = 304;
+                response.status_text = "Not Modified";
+                response.extra_headers.emplace_back("ETag", etag);
+                response.extra_headers.emplace_back("Last-Modified", last_modified);
+                response.extra_headers.emplace_back("Cache-Control", "public, max-age=300");
+                return response;
+            }
+        }
+
+        std::ifstream input(file_path, std::ios::binary);
+        if (!input) {
+            return not_found();
+        }
+        std::string body;
+        body.resize(static_cast<std::size_t>(file_size));
+        if (file_size > 0) {
+            input.read(&body[0], static_cast<std::streamsize>(file_size));
+            body.resize(static_cast<std::size_t>(input.gcount()));
+        }
+
+        Response response;
+        response.content_type = mime_type(file_path);
+        response.extra_headers.emplace_back("ETag", etag);
+        response.extra_headers.emplace_back("Last-Modified", last_modified);
+        response.extra_headers.emplace_back("Cache-Control", "public, max-age=300");
+        response.extra_headers.emplace_back("Accept-Ranges", "bytes");
+
+        const std::string range_header = header_get(request, "range");
+        if (!range_header.empty() && header_get(request, "if-range").empty()) {
+            const ByteRange range =
+                parse_byte_range(range_header, static_cast<std::uint64_t>(body.size()));
+            if (range.status == ByteRange::Status::invalid) {
+                return bad_request("Invalid Range header.");
+            }
+            if (range.status == ByteRange::Status::unsatisfiable) {
+                Response unsat;
+                unsat.status = 416;
+                unsat.status_text = "Range Not Satisfiable";
+                unsat.content_type = response.content_type;
+                unsat.extra_headers = response.extra_headers;
+                unsat.extra_headers.emplace_back(
+                    "Content-Range", "bytes */" + std::to_string(body.size()));
+                return unsat;
+            }
+            if (range.status == ByteRange::Status::ok) {
+                const std::size_t begin = static_cast<std::size_t>(range.start);
+                const std::size_t end = static_cast<std::size_t>(range.end);
+                response.status = 206;
+                response.status_text = "Partial Content";
+                response.body = body.substr(begin, end - begin + 1);
+                response.extra_headers.emplace_back(
+                    "Content-Range", "bytes " + std::to_string(range.start) + "-" +
+                                         std::to_string(range.end) + "/" +
+                                         std::to_string(body.size()));
+                return response;
+            }
+        }
+
+        response.body = std::move(body);
+        return response;
+    }
+
+    ServerConfig cfg_;
+    Metrics metrics_;
+    RateLimiter limiter_;
+    AccessLog log_;
+    SseHub hub_;
+    ThreadPool pool_;
+    std::chrono::steady_clock::time_point started_;
+};
 
 }  // namespace aster

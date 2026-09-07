@@ -1,80 +1,87 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
-#include <cstddef>
 #include <functional>
 #include <mutex>
 #include <queue>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace aster {
 
-// Bounded worker pool: jobs are queued and executed by a fixed set of threads.
-// shutdown() drains any queued jobs before joining and is safe to call twice.
 class ThreadPool {
 public:
-    explicit ThreadPool(std::size_t n) {
-        workers_.reserve(n);
-        for (std::size_t i = 0; i < n; ++i) {
-            workers_.emplace_back([this] { worker_loop(); });
+    ThreadPool(int workers, std::size_t max_queue)
+        : max_queue_(max_queue == 0 ? 32 : max_queue) {
+        const int count = workers < 1 ? 1 : workers;
+        workers_.reserve(static_cast<std::size_t>(count));
+        for (int i = 0; i < count; ++i) {
+            workers_.emplace_back([this] { run(); });
         }
     }
+
+    ~ThreadPool() { stop(); }
 
     ThreadPool(const ThreadPool&) = delete;
     ThreadPool& operator=(const ThreadPool&) = delete;
 
-    void submit(std::function<void()> job) {
+    bool submit(std::function<void()> job) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (stopping_) {
+            if (stop_ || queue_.size() >= max_queue_) {
+                return false;
+            }
+            queue_.push(std::move(job));
+        }
+        cv_.notify_one();
+        return true;
+    }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stop_) {
                 return;
             }
-            jobs_.push(std::move(job));
+            stop_ = true;
         }
-        condition_.notify_one();
-    }
-
-    void shutdown() {
-        std::vector<std::thread> workers;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            stopping_ = true;
-            workers.swap(workers_);
+        cv_.notify_all();
+        for (auto& worker : workers_) {
+            if (worker.joinable()) {
+                worker.join();
+            }
         }
-        condition_.notify_all();
-        for (std::thread& worker : workers) {
-            worker.join();
-        }
-    }
-
-    ~ThreadPool() {
-        shutdown();
+        workers_.clear();
     }
 
 private:
-    void worker_loop() {
-        while (true) {
+    void run() {
+        for (;;) {
             std::function<void()> job;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                condition_.wait(lock, [this] { return stopping_ || !jobs_.empty(); });
-                if (jobs_.empty()) {
-                    // stopping_ is set and the queue is drained.
+                cv_.wait(lock, [this] { return stop_ || !queue_.empty(); });
+                if (stop_ && queue_.empty()) {
                     return;
                 }
-                job = std::move(jobs_.front());
-                jobs_.pop();
+                job = std::move(queue_.front());
+                queue_.pop();
             }
-            job();
+            try {
+                job();
+            } catch (...) {
+            }
         }
     }
 
+    std::size_t max_queue_;
     std::mutex mutex_;
-    std::condition_variable condition_;
-    std::queue<std::function<void()>> jobs_;
+    std::condition_variable cv_;
+    std::queue<std::function<void()>> queue_;
     std::vector<std::thread> workers_;
-    bool stopping_ = false;
+    bool stop_ = false;
 };
 
 }  // namespace aster

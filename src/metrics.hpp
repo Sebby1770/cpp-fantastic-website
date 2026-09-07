@@ -1,172 +1,150 @@
 #pragma once
 
-#include "util.hpp"
+#include "json.hpp"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <chrono>
-#include <map>
+#include <cstddef>
+#include <cstdint>
 #include <mutex>
-#include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace aster {
 
 class Metrics {
 public:
-    Metrics() : started_at_(std::chrono::steady_clock::now()) {}
+    struct Snapshot {
+        std::uint64_t requests = 0;
+        std::uint64_t s2xx = 0;
+        std::uint64_t s3xx = 0;
+        std::uint64_t s4xx = 0;
+        std::uint64_t s5xx = 0;
+        std::size_t latency_count = 0;
+        double mean = 0;
+        double max = 0;
+        double p50 = 0;
+        double p99 = 0;
+        std::unordered_map<std::string, std::uint64_t> by_path;
+    };
 
-    void record(const std::string& path, int status, std::chrono::microseconds latency) {
-        total_requests_.fetch_add(1, std::memory_order_relaxed);
-        std::lock_guard<std::mutex> lock(mutex_);
-        ++by_path_[path];
-        const int status_class = status / 100;
-        if (status_class >= 2 && status_class <= 5) {
-            ++status_classes_[static_cast<std::size_t>(status_class - 2)];
+    void record(const std::string& path, int status, double ms) {
+        requests_.fetch_add(1, std::memory_order_relaxed);
+        const int klass = status / 100;
+        if (klass == 2) {
+            s2xx_.fetch_add(1, std::memory_order_relaxed);
+        } else if (klass == 3) {
+            s3xx_.fetch_add(1, std::memory_order_relaxed);
+        } else if (klass == 4) {
+            s4xx_.fetch_add(1, std::memory_order_relaxed);
+        } else if (klass == 5) {
+            s5xx_.fetch_add(1, std::memory_order_relaxed);
         }
-        latencies_us_[latency_count_ % kLatencyWindow] = latency.count();
-        ++latency_count_;
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        by_path_[path] += 1;
+        const std::size_t index = lat_i_ % kRing;
+        if (lat_n_ < kRing) {
+            lat_sum_ += ms;
+            lat_[index] = ms;
+            ++lat_n_;
+        } else {
+            lat_sum_ -= lat_[index];
+            lat_sum_ += ms;
+            lat_[index] = ms;
+        }
+        ++lat_i_;
+        if (ms > lat_max_) {
+            lat_max_ = ms;
+        }
     }
 
-    std::uint64_t total_requests() const {
-        return total_requests_.load(std::memory_order_relaxed);
-    }
+    std::uint64_t request_count() const { return requests_.load(std::memory_order_relaxed); }
 
-    std::int64_t uptime_seconds() const {
-        const auto now = std::chrono::steady_clock::now();
-        return std::chrono::duration_cast<std::chrono::seconds>(now - started_at_).count();
+    Snapshot snapshot() const {
+        Snapshot out;
+        out.requests = requests_.load(std::memory_order_relaxed);
+        out.s2xx = s2xx_.load(std::memory_order_relaxed);
+        out.s3xx = s3xx_.load(std::memory_order_relaxed);
+        out.s4xx = s4xx_.load(std::memory_order_relaxed);
+        out.s5xx = s5xx_.load(std::memory_order_relaxed);
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        out.by_path = by_path_;
+        out.latency_count = lat_n_;
+        out.max = lat_max_;
+        if (lat_n_ == 0) {
+            return out;
+        }
+        out.mean = lat_sum_ / static_cast<double>(lat_n_);
+        std::vector<double> copy(lat_.begin(), lat_.begin() + static_cast<std::ptrdiff_t>(lat_n_));
+        std::sort(copy.begin(), copy.end());
+        out.p50 = copy[(copy.size() - 1) / 2];
+        const std::size_t idx99 =
+            copy.empty() ? 0 : (copy.size() * 99) / 100;
+        out.p99 = copy[std::min(copy.size() - 1, idx99)];
+        return out;
     }
 
     std::string to_json() const {
-        Snapshot snapshot = collect(0);
-        std::ostringstream json;
-        json << "{";
-        json << "\"total_requests\":" << snapshot.total_requests << ",";
-        json << "\"uptime_seconds\":" << snapshot.uptime_seconds << ",";
-        json << "\"by_path\":" << by_path_json(snapshot.by_path) << ",";
-        json << "\"status\":" << status_json(snapshot.status_classes) << ",";
-        json << "\"latency_ms\":" << latency_json(std::move(snapshot.latency_sample));
-        json << "}";
-        return json.str();
+        const Snapshot snap = snapshot();
+        Json::Obj latency;
+        latency.kv("count", static_cast<unsigned long long>(snap.latency_count));
+        latency.kv("mean", snap.mean);
+        latency.kv("max", snap.max);
+        latency.kv("p50", snap.p50);
+        latency.kv("p99", snap.p99);
+
+        Json::Obj status;
+        status.kv("2xx", snap.s2xx);
+        status.kv("3xx", snap.s3xx);
+        status.kv("4xx", snap.s4xx);
+        status.kv("5xx", snap.s5xx);
+
+        Json::Obj by_path;
+        for (const auto& entry : snap.by_path) {
+            by_path.kv(entry.first, entry.second);
+        }
+
+        Json::Obj totals;
+        totals.kv("requests", snap.requests);
+
+        Json::Obj root;
+        root.kv("totals", totals.done());
+        root.kv("by_path", by_path.done());
+        root.kv("latency_ms", latency.done());
+        root.kv("status", status.done());
+        return root.done().str();
     }
 
-    // Compact per-tick telemetry frame for the /api/stream SSE feed. Shares the
-    // locked snapshot with to_json but trims by_path to the top 6 paths.
-    std::string snapshot_json(std::uint64_t tick) const {
-        Snapshot snapshot = collect(6);
-        std::ostringstream json;
-        json << "{";
-        json << "\"tick\":" << tick << ",";
-        json << "\"uptime_seconds\":" << snapshot.uptime_seconds << ",";
-        json << "\"total_requests\":" << snapshot.total_requests << ",";
-        json << "\"status\":" << status_json(snapshot.status_classes) << ",";
-        json << "\"latency_ms\":" << latency_json(std::move(snapshot.latency_sample)) << ",";
-        json << "\"by_path\":" << by_path_json(snapshot.by_path);
-        json << "}";
-        return json.str();
+    std::string telemetry_json(long long uptime_seconds) const {
+        const Snapshot snap = snapshot();
+        Json::Obj root;
+        root.kv("requests", snap.requests);
+        root.kv("p99", snap.p99);
+        root.kv("2xx", snap.s2xx);
+        root.kv("4xx", snap.s4xx);
+        root.kv("5xx", snap.s5xx);
+        root.kv("uptime_seconds", uptime_seconds);
+        return root.done().str();
     }
 
 private:
-    static constexpr std::size_t kLatencyWindow = 1024;
-
-    struct Snapshot {
-        std::uint64_t total_requests = 0;
-        std::int64_t uptime_seconds = 0;
-        std::vector<std::pair<std::string, std::uint64_t>> by_path;
-        std::array<std::uint64_t, 4> status_classes{};
-        std::vector<std::int64_t> latency_sample;
-    };
-
-    // Copy everything out under the lock. top_n == 0 keeps every path (sorted
-    // by name, matching the historical map iteration order); otherwise keep the
-    // top_n busiest paths.
-    Snapshot collect(std::size_t top_n) const {
-        Snapshot snapshot;
-        snapshot.total_requests = total_requests();
-        snapshot.uptime_seconds = uptime_seconds();
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            snapshot.by_path.assign(by_path_.begin(), by_path_.end());
-            snapshot.status_classes = status_classes_;
-            const std::size_t sample_size = std::min(latency_count_, kLatencyWindow);
-            snapshot.latency_sample.assign(
-                latencies_us_.begin(),
-                latencies_us_.begin() + static_cast<std::ptrdiff_t>(sample_size));
-        }
-        if (top_n > 0 && snapshot.by_path.size() > top_n) {
-            std::partial_sort(snapshot.by_path.begin(),
-                              snapshot.by_path.begin() + static_cast<std::ptrdiff_t>(top_n),
-                              snapshot.by_path.end(),
-                              [](const auto& a, const auto& b) { return a.second > b.second; });
-            snapshot.by_path.resize(top_n);
-        }
-        return snapshot;
-    }
-
-    static std::string by_path_json(
-        const std::vector<std::pair<std::string, std::uint64_t>>& by_path) {
-        std::ostringstream json;
-        json << "{";
-        bool first = true;
-        for (const auto& entry : by_path) {
-            if (!first) {
-                json << ",";
-            }
-            first = false;
-            json << "\"" << json_escape(entry.first) << "\":" << entry.second;
-        }
-        json << "}";
-        return json.str();
-    }
-
-    static std::string status_json(const std::array<std::uint64_t, 4>& status_classes) {
-        std::ostringstream json;
-        json << "{";
-        json << "\"2xx\":" << status_classes[0] << ",";
-        json << "\"3xx\":" << status_classes[1] << ",";
-        json << "\"4xx\":" << status_classes[2] << ",";
-        json << "\"5xx\":" << status_classes[3];
-        json << "}";
-        return json.str();
-    }
-
-    static std::string latency_json(std::vector<std::int64_t> sample) {
-        std::ostringstream json;
-        json << std::fixed << std::setprecision(3);
-        json << "{\"count\":" << sample.size();
-        if (sample.empty()) {
-            json << ",\"mean\":0,\"max\":0,\"p50\":0,\"p99\":0}";
-            return json.str();
-        }
-        double sum_us = 0.0;
-        std::int64_t max_us = 0;
-        for (const std::int64_t value : sample) {
-            sum_us += static_cast<double>(value);
-            max_us = std::max(max_us, value);
-        }
-        const auto percentile_us = [&sample](double fraction) {
-            const auto index = static_cast<std::ptrdiff_t>(
-                fraction * static_cast<double>(sample.size() - 1));
-            std::nth_element(sample.begin(), sample.begin() + index, sample.end());
-            return static_cast<double>(sample[static_cast<std::size_t>(index)]);
-        };
-        json << ",\"mean\":" << (sum_us / static_cast<double>(sample.size()) / 1000.0);
-        json << ",\"max\":" << (static_cast<double>(max_us) / 1000.0);
-        json << ",\"p50\":" << (percentile_us(0.50) / 1000.0);
-        json << ",\"p99\":" << (percentile_us(0.99) / 1000.0);
-        json << "}";
-        return json.str();
-    }
-
-    std::chrono::steady_clock::time_point started_at_;
-    std::atomic<std::uint64_t> total_requests_{0};
+    static constexpr std::size_t kRing = 1024;
+    std::atomic<std::uint64_t> requests_{0};
+    std::atomic<std::uint64_t> s2xx_{0};
+    std::atomic<std::uint64_t> s3xx_{0};
+    std::atomic<std::uint64_t> s4xx_{0};
+    std::atomic<std::uint64_t> s5xx_{0};
     mutable std::mutex mutex_;
-    std::map<std::string, std::uint64_t> by_path_;
-    std::array<std::uint64_t, 4> status_classes_{};
-    std::array<std::int64_t, kLatencyWindow> latencies_us_{};
-    std::size_t latency_count_ = 0;
+    std::array<double, kRing> lat_{};
+    std::size_t lat_i_ = 0;
+    std::size_t lat_n_ = 0;
+    double lat_sum_ = 0;
+    double lat_max_ = 0;
+    std::unordered_map<std::string, std::uint64_t> by_path_;
 };
 
 }  // namespace aster

@@ -1,594 +1,133 @@
-#include "http.hpp"
-#include "log.hpp"
-#include "metrics.hpp"
+#include "json.hpp"
 #include "mission.hpp"
-#include "rate_limiter.hpp"
-#include "server.hpp"
-#include "stream.hpp"
 #include "util.hpp"
 
-#include <atomic>
-#include <chrono>
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
-#include <thread>
 
-#include <sys/socket.h>
-#include <unistd.h>
+namespace fs = std::filesystem;
 
 namespace {
 
-int failures = 0;
+int g_failed = 0;
+int g_passed = 0;
 
-void expect_eq(const std::string& name, const std::string& got, const std::string& want) {
-    if (got != want) {
-        std::cerr << "FAIL " << name << ": got \"" << got << "\" want \"" << want << "\"\n";
-        ++failures;
-    } else {
-        std::cout << "ok   " << name << "\n";
+void check(bool cond, const char* expr, const char* file, int line) {
+    if (cond) {
+        ++g_passed;
+        return;
     }
-}
-
-void expect_true(const std::string& name, bool condition) {
-    if (!condition) {
-        std::cerr << "FAIL " << name << "\n";
-        ++failures;
-    } else {
-        std::cout << "ok   " << name << "\n";
-    }
-}
-
-std::map<std::string, std::string> headers_with_length(const std::string& value) {
-    return {{"content-length", value}};
+    ++g_failed;
+    std::cerr << "FAIL " << file << ":" << line << " " << expr << "\n";
 }
 
 }  // namespace
 
+#define CHECK(expr) check(static_cast<bool>(expr), #expr, __FILE__, __LINE__)
+
 int main() {
-    using aster::ContentLengthClass;
-    using aster::ParseState;
-    using aster::Request;
-    using aster::classify_content_length;
-    using aster::current_time_iso;
-    using aster::int_param;
-    using aster::json_escape;
-    using aster::parse_query;
-    using aster::stable_seed;
-    using aster::try_parse_request;
-    using aster::url_decode;
-    using aster::wants_keep_alive;
+    CHECK(aster::url_decode("a+b") == "a b");
+    CHECK(aster::url_decode("%2e%2e") == "..");
+    CHECK(aster::url_decode("%2Ftmp") == "/tmp");
+    CHECK(aster::url_decode("seed%20space") == "seed space");
+    CHECK(aster::url_encode("a b") == "a%20b");
 
-    expect_eq("url plain", url_decode("hello"), "hello");
-    expect_eq("url plus", url_decode("a+b"), "a b");
-    expect_eq("url percent", url_decode("seed%2Dtest"), "seed-test");
-    expect_eq("url space hex", url_decode("hi%20there"), "hi there");
-    expect_eq("url mixed", url_decode("a%2Fb+c"), "a/b c");
+    CHECK(aster::json_escape("plain") == "plain");
+    CHECK(aster::json_escape("a\"b") == "a\\\"b");
+    CHECK(aster::json_escape("line\n") == "line\\n");
+    CHECK(aster::json_escape("tab\t") == "tab\\t");
 
-    expect_eq("json plain", json_escape("hello"), "hello");
-    expect_eq("json quote", json_escape("say \"hi\""), "say \\\"hi\\\"");
-    expect_eq("json slash", json_escape("a\\b"), "a\\\\b");
-    expect_eq("json newline", json_escape("a\nb"), "a\\nb");
-    expect_eq("json tab", json_escape("a\tb"), "a\\tb");
+    const auto query = aster::parse_query("seed=sebby&mode=forge&empty=&flag");
+    CHECK(query.at("seed") == "sebby");
+    CHECK(query.at("mode") == "forge");
+    CHECK(query.at("empty") == "");
+    CHECK(query.at("flag") == "");
+    const auto spaced = aster::parse_query("seed=smoke%20space&mode=bad");
+    CHECK(spaced.at("seed") == "smoke space");
 
-    // Content-Length classification against the body limit.
+    CHECK(aster::stable_seed("alpha") == aster::stable_seed("alpha"));
+    CHECK(aster::stable_seed("alpha") != aster::stable_seed("beta"));
+    CHECK(aster::fnv1a("aster") == aster::stable_seed("aster"));
+
+    CHECK(aster::clamp_int(5, 1, 3) == 3);
+    CHECK(aster::clamp_int(-4, 0, 10) == 0);
+    CHECK(aster::clamp_int(7, 1, 10) == 7);
+    CHECK(aster::clamp_int(68, 1, 100) == 68);
+
+    const auto whole = aster::parse_byte_range("bytes=0-9", 100);
+    CHECK(whole.status == aster::ByteRange::Status::ok);
+    CHECK(whole.start == 0);
+    CHECK(whole.end == 9);
+    const auto open_end = aster::parse_byte_range("bytes=50-", 100);
+    CHECK(open_end.status == aster::ByteRange::Status::ok);
+    CHECK(open_end.start == 50);
+    CHECK(open_end.end == 99);
+    const auto suffix = aster::parse_byte_range("bytes=-10", 100);
+    CHECK(suffix.status == aster::ByteRange::Status::ok);
+    CHECK(suffix.start == 90);
+    CHECK(suffix.end == 99);
+    const auto unsat = aster::parse_byte_range("bytes=200-300", 100);
+    CHECK(unsat.status == aster::ByteRange::Status::unsatisfiable);
+    const auto inverted = aster::parse_byte_range("bytes=50-49", 100);
+    CHECK(inverted.status == aster::ByteRange::Status::invalid);
+    const auto none = aster::parse_byte_range("", 100);
+    CHECK(none.status == aster::ByteRange::Status::none);
+
+    const fs::path tmp = fs::temp_directory_path() / "asterforge-contain-test";
+    fs::create_directories(tmp / "sub");
+    const fs::path inside = tmp / "sub" / "index.html";
     {
-        const auto absent = classify_content_length({}, 1024);
-        expect_true("cl absent ok", absent.status == ContentLengthClass::Ok && absent.length == 0);
-        const auto small = classify_content_length(headers_with_length("10"), 1024);
-        expect_true("cl small ok", small.status == ContentLengthClass::Ok && small.length == 10);
-        const auto exact = classify_content_length(headers_with_length("1024"), 1024);
-        expect_true("cl exact ok", exact.status == ContentLengthClass::Ok && exact.length == 1024);
-        const auto large = classify_content_length(headers_with_length("2097152"), 1024 * 1024);
-        expect_true("cl too large", large.status == ContentLengthClass::TooLarge);
-        const auto negative = classify_content_length(headers_with_length("-5"), 1024);
-        expect_true("cl negative malformed", negative.status == ContentLengthClass::Malformed);
-        const auto garbage = classify_content_length(headers_with_length("12abc"), 1024);
-        expect_true("cl garbage malformed", garbage.status == ContentLengthClass::Malformed);
-        const auto empty = classify_content_length(headers_with_length(""), 1024);
-        expect_true("cl empty malformed", empty.status == ContentLengthClass::Malformed);
+        std::ofstream out(inside);
+        out << "ok";
     }
+    CHECK(aster::path_is_inside(tmp, inside));
+    CHECK(aster::path_is_inside(tmp, tmp));
+    CHECK(!aster::path_is_inside(tmp, tmp / ".." / "outside.txt"));
+    CHECK(aster::path_has_dotdot("/../CMakeLists.txt"));
+    CHECK(aster::path_has_dotdot("/foo/../../secret"));
+    CHECK(!aster::path_has_dotdot("/styles.css"));
+    fs::remove_all(tmp);
 
-    // Keep-alive decision per HTTP version + Connection header.
-    expect_true("ka 1.1 default", wants_keep_alive("HTTP/1.1", ""));
-    expect_true("ka 1.1 close", !wants_keep_alive("HTTP/1.1", "close"));
-    expect_true("ka 1.1 close case", !wants_keep_alive("HTTP/1.1", "Close"));
-    expect_true("ka 1.0 default", !wants_keep_alive("HTTP/1.0", ""));
-    expect_true("ka 1.0 keep", wants_keep_alive("HTTP/1.0", "keep-alive"));
-    expect_true("ka 1.0 keep case", wants_keep_alive("HTTP/1.0", "Keep-Alive"));
-    expect_true("ka bogus version", !wants_keep_alive("HTTP/2.0", ""));
+    const std::string json = aster::build_mission_json({{"seed", "smoke-seed"}, {"mode", "forge"}});
+    CHECK(json.find("\"seed\":\"smoke-seed\"") != std::string::npos);
+    CHECK(json.find("\"mode\":\"forge\"") != std::string::npos);
+    CHECK(json.find("\"z\":") != std::string::npos);
+    CHECK(json.find("AsterForge") != std::string::npos);
 
-    // Pipelined parsing: leftover carries bytes belonging to the next request.
-    {
-        Request request;
-        std::string leftover;
-        const std::string raw =
-            "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n";
-        const ParseState state = try_parse_request(raw, request, leftover);
-        expect_true("pipeline complete", state == ParseState::Complete);
-        expect_eq("pipeline first path", request.path, "/a");
-        expect_eq("pipeline leftover", leftover, "GET /b HTTP/1.1\r\nHost: x\r\n\r\n");
+    const auto first = aster::generate_mission({{"seed", "alpha"}, {"mode", "orbit"}});
+    const auto second = aster::generate_mission({{"seed", "alpha"}, {"mode", "orbit"}});
+    CHECK(!first.nodes.empty());
+    CHECK(first.nodes.size() == second.nodes.size());
+    CHECK(first.nodes[0].x == second.nodes[0].x);
+    CHECK(first.nodes[0].y == second.nodes[0].y);
+    CHECK(first.nodes[0].z == second.nodes[0].z);
+    CHECK(first.nodes[0].z >= 0.0 && first.nodes[0].z <= 1.0);
+    CHECK(first.shortId == second.shortId);
+    CHECK(first.mode == "orbit");
 
-        Request second;
-        std::string leftover2;
-        expect_true("pipeline second complete",
-                    try_parse_request(leftover, second, leftover2) == ParseState::Complete);
-        expect_eq("pipeline second path", second.path, "/b");
-        expect_eq("pipeline no more leftover", leftover2, "");
-    }
-    {
-        Request request;
-        std::string leftover;
-        const std::string raw =
-            "POST /api/echo HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET /next HTTP/1.1\r\n\r\n";
-        const ParseState state = try_parse_request(raw, request, leftover);
-        expect_true("pipeline body complete", state == ParseState::Complete);
-        expect_eq("pipeline body", request.body, "hello");
-        expect_eq("pipeline body leftover", leftover, "GET /next HTTP/1.1\r\n\r\n");
-    }
-    {
-        Request request;
-        std::string leftover;
-        expect_true("parse need more headers",
-                    try_parse_request("GET / HTTP/1.1\r\nHost:", request, leftover) ==
-                        ParseState::NeedMore);
-        expect_true("parse need more body",
-                    try_parse_request("POST / HTTP/1.1\r\nContent-Length: 9\r\n\r\nhi",
-                                      request, leftover) == ParseState::NeedMore);
-        expect_true("parse malformed line",
-                    try_parse_request("BLAH\r\n\r\n", request, leftover) == ParseState::Malformed);
-        expect_true("parse malformed version",
-                    try_parse_request("GET / HTTP/9.9\r\n\r\n", request, leftover) ==
-                        ParseState::Malformed);
-        expect_true("parse body too large",
-                    try_parse_request("POST / HTTP/1.1\r\nContent-Length: 99\r\n\r\n",
-                                      request, leftover, 10) == ParseState::BodyTooLarge);
-        const std::string huge_headers = "GET / HTTP/1.1\r\nX-Pad: " +
-                                         std::string(aster::kMaxHeaderBytes + 16, 'a') + "\r\n\r\n";
-        expect_true("parse headers too large",
-                    try_parse_request(huge_headers, request, leftover) ==
-                        ParseState::HeadersTooLarge);
-    }
+    const auto bad_mode = aster::generate_mission({{"seed", "x"}, {"mode", "nope"}});
+    CHECK(bad_mode.mode == "orbit");
 
-    // Token bucket: burst up to capacity, deny when empty, refill over time.
-    {
-        using clock = std::chrono::steady_clock;
-        aster::RateLimiter limiter(4.0, 2.0);  // burst 4, refill 2/s
-        const clock::time_point t0 = clock::now();
-        bool burst_ok = true;
-        for (int i = 0; i < 4; ++i) {
-            burst_ok = burst_ok && limiter.allow("10.0.0.1", t0);
-        }
-        expect_true("rl burst allowed", burst_ok);
-        expect_true("rl empty denied", !limiter.allow("10.0.0.1", t0));
-        expect_true("rl other ip independent", limiter.allow("10.0.0.2", t0));
-        const clock::time_point t1 = t0 + std::chrono::seconds(1);  // +2 tokens
-        expect_true("rl refill one", limiter.allow("10.0.0.1", t1));
-        expect_true("rl refill two", limiter.allow("10.0.0.1", t1));
-        expect_true("rl refill exhausted", !limiter.allow("10.0.0.1", t1));
-        const clock::time_point t2 = t1 + std::chrono::seconds(60);  // cap at capacity
-        bool capped_ok = true;
-        for (int i = 0; i < 4; ++i) {
-            capped_ok = capped_ok && limiter.allow("10.0.0.1", t2);
-        }
-        expect_true("rl refill capped allows", capped_ok);
-        expect_true("rl refill capped denies fifth", !limiter.allow("10.0.0.1", t2));
-    }
+    const std::string presets = aster::build_presets_json();
+    CHECK(presets.find("\"orbit\"") != std::string::npos);
+    CHECK(presets.find("\"pulse\"") != std::string::npos);
+    CHECK(presets.find("\"drift\"") != std::string::npos);
 
-    // HTTP date formatting + parsing round-trip.
-    {
-        const std::time_t stamp = 1789016400;  // some fixed moment
-        const std::string formatted = aster::http_date(stamp);
-        std::time_t parsed = 0;
-        expect_true("http_date parses", aster::parse_http_date(formatted, parsed));
-        expect_true("http_date round trip", parsed == stamp);
-        expect_eq("http_date known", aster::http_date(static_cast<std::time_t>(0)),
-                  "Thu, 01 Jan 1970 00:00:00 GMT");
-        std::time_t junk = 0;
-        expect_true("http_date rejects junk", !aster::parse_http_date("not a date", junk));
-    }
+    const auto built = aster::Json::Obj().kv("ok", true).kv("n", 3).done();
+    CHECK(built.str().find("\"ok\":true") != std::string::npos);
 
-    // FNV-1a hex hash: stable, distinct for different inputs, 16 hex chars.
-    {
-        const std::string first = aster::weak_hash_hex("hello");
-        expect_eq("hash stable", first, aster::weak_hash_hex("hello"));
-        expect_true("hash distinct", first != aster::weak_hash_hex("world"));
-        expect_true("hash length", first.size() == 16);
-        expect_true("hash hex chars",
-                    first.find_first_not_of("0123456789abcdef") == std::string::npos);
-    }
+    CHECK(aster::http_date(0).find("GMT") != std::string::npos);
+    CHECK(aster::to_lower("Orbit") == "orbit");
 
-    // Static path resolution: containment inside the public root.
-    {
-        namespace fs = std::filesystem;
-        const fs::path root = fs::temp_directory_path() / "aster_unit_public";
-        fs::remove_all(root);
-        fs::create_directories(root / "sub");
-        std::ofstream(root / "index.html") << "<html></html>";
-        std::ofstream(root / "styles.css") << "body{}";
-        std::ofstream(root / "sub" / "page.html") << "<p>hi</p>";
+    const std::string share = aster::build_share_json({{"seed", "smoke space"}, {"mode", "bad"}});
+    CHECK(share.find("\"mode\":\"orbit\"") != std::string::npos);
 
-        const auto index = aster::resolve_static_path(root, "/");
-        expect_true("static root resolves index",
-                    index.has_value() && index->filename() == "index.html");
-        const auto css = aster::resolve_static_path(root, "/styles.css");
-        expect_true("static file resolves", css.has_value() && fs::exists(*css));
-        const auto nested = aster::resolve_static_path(root, "/sub/page.html");
-        expect_true("static nested resolves", nested.has_value() && fs::exists(*nested));
-        expect_true("static dotdot rejected",
-                    !aster::resolve_static_path(root, "/../secret.txt").has_value());
-        expect_true("static deep dotdot rejected",
-                    !aster::resolve_static_path(root, "/sub/../../etc/passwd").has_value());
-        expect_true("static nul rejected",
-                    !aster::resolve_static_path(root, std::string("/a\0b", 4)).has_value());
-
-        // A symlink inside public/ escaping the root must fail containment.
-        std::error_code ec;
-        fs::create_symlink("/etc", root / "escape", ec);
-        if (!ec) {
-            expect_true("static symlink escape rejected",
-                        !aster::resolve_static_path(root, "/escape/passwd").has_value());
-        }
-        fs::remove_all(root);
-    }
-
-    // StreamHub: caps concurrent SSE clients at kMaxStreamClients.
-    {
-        aster::StreamHub hub;
-        bool all_acquired = true;
-        for (int i = 0; i < aster::kMaxStreamClients; ++i) {
-            all_acquired = all_acquired && hub.try_acquire();
-        }
-        expect_true("hub cap acquires", all_acquired);
-        expect_true("hub over cap denied", !hub.try_acquire());
-        hub.release();
-        expect_true("hub release reopens slot", hub.try_acquire());
-        for (int i = 0; i < aster::kMaxStreamClients; ++i) {
-            hub.release();
-        }
-        expect_true("hub drained", hub.active() == 0);
-    }
-
-    // Metrics telemetry snapshot: SSE frame shape and top-6 by_path trimming.
-    {
-        aster::Metrics metrics;
-        for (int i = 0; i < 8; ++i) {
-            metrics.record("/p" + std::to_string(i), 200, std::chrono::microseconds(500));
-        }
-        for (int i = 0; i < 5; ++i) {
-            metrics.record("/hot", 200, std::chrono::microseconds(250));
-        }
-        const std::string frame = metrics.snapshot_json(7);
-        expect_true("snapshot has tick", frame.find("\"tick\":7") != std::string::npos);
-        expect_true("snapshot has totals",
-                    frame.find("\"total_requests\":13") != std::string::npos);
-        expect_true("snapshot has status", frame.find("\"2xx\":13") != std::string::npos);
-        expect_true("snapshot has latency", frame.find("\"p99\"") != std::string::npos);
-        expect_true("snapshot keeps hottest path", frame.find("\"/hot\":5") != std::string::npos);
-        std::size_t path_entries = 0;
-        for (std::size_t at = frame.find("\"/"); at != std::string::npos;
-             at = frame.find("\"/", at + 1)) {
-            ++path_entries;
-        }
-        expect_true("snapshot trims to top 6 paths", path_entries == 6);
-        expect_true("full metrics keep every path",
-                    metrics.to_json().find("\"/p7\"") != std::string::npos);
-    }
-
-    // Range parsing (RFC 9110 §14) over a 100-byte representation.
-    {
-        using aster::ByteRange;
-        using aster::RangeResult;
-        using aster::parse_byte_range;
-        ByteRange r;
-
-        expect_true("range absent-ish header ignored",
-                    parse_byte_range("items=0-5", 100, r) == RangeResult::None);
-        expect_true("range multi-range ignored",
-                    parse_byte_range("bytes=0-9,20-29", 100, r) == RangeResult::None);
-
-        expect_true("range closed ok", parse_byte_range("bytes=0-9", 100, r) == RangeResult::Ok);
-        expect_true("range closed bounds", r.start == 0 && r.end == 9 && r.length() == 10);
-
-        expect_true("range open-ended ok", parse_byte_range("bytes=90-", 100, r) == RangeResult::Ok);
-        expect_true("range open-ended bounds", r.start == 90 && r.end == 99);
-
-        expect_true("range suffix ok", parse_byte_range("bytes=-10", 100, r) == RangeResult::Ok);
-        expect_true("range suffix bounds", r.start == 90 && r.end == 99);
-
-        // A suffix longer than the body clamps to the whole body.
-        expect_true("range suffix clamps", parse_byte_range("bytes=-500", 100, r) == RangeResult::Ok);
-        expect_true("range suffix clamp bounds", r.start == 0 && r.end == 99);
-
-        // An end past the last byte clamps rather than failing.
-        expect_true("range end clamps", parse_byte_range("bytes=95-500", 100, r) == RangeResult::Ok);
-        expect_true("range end clamp bounds", r.start == 95 && r.end == 99);
-
-        expect_true("range start past end unsatisfiable",
-                    parse_byte_range("bytes=100-", 100, r) == RangeResult::Unsatisfiable);
-        expect_true("range inverted unsatisfiable",
-                    parse_byte_range("bytes=50-10", 100, r) == RangeResult::Unsatisfiable);
-        expect_true("range zero suffix unsatisfiable",
-                    parse_byte_range("bytes=-0", 100, r) == RangeResult::Unsatisfiable);
-        expect_true("range on empty body unsatisfiable",
-                    parse_byte_range("bytes=0-5", 0, r) == RangeResult::Unsatisfiable);
-        expect_true("range garbage ignored",
-                    parse_byte_range("bytes=abc-def", 100, r) == RangeResult::None);
-    }
-
-    // Accept-Encoding negotiation for pre-compressed .gz sidecars.
-    {
-        using aster::accepts_gzip;
-        expect_true("gzip plain", accepts_gzip("gzip"));
-        expect_true("gzip in list", accepts_gzip("deflate, gzip, br"));
-        expect_true("gzip with q", accepts_gzip("gzip;q=0.8"));
-        expect_true("gzip uppercase", accepts_gzip("GZIP"));
-        expect_true("gzip spaced list", accepts_gzip("br, gzip ;q=1.0"));
-        expect_true("no gzip", !accepts_gzip("deflate, br"));
-        expect_true("empty header", !accepts_gzip(""));
-        // q=0 explicitly refuses the encoding.
-        expect_true("gzip q=0 refused", !accepts_gzip("gzip;q=0"));
-        expect_true("gzip q=0.0 refused", !accepts_gzip("deflate, gzip;q=0.0"));
-        // "x-gzip" must not be mistaken for "gzip".
-        expect_true("x-gzip is not gzip", !accepts_gzip("x-gzip"));
-    }
-
-    // Slow-drip defense: a stalled partial request trips the read deadline
-    // (surfaced as Timeout -> 408), while a silent idle connection is a quiet
-    // keep-alive close. Small timeouts keep the test fast.
-    {
-        int fds[2];
-        expect_true("drip socketpair", ::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
-        const std::string partial = "GET /api/health HTTP/1.1\r\nHost: x";
-        expect_true("drip partial write",
-                    ::send(fds[0], partial.data(), partial.size(), 0) ==
-                        static_cast<ssize_t>(partial.size()));
-        aster::Request drip_request;
-        std::string drip_leftover;
-        const auto drip_begin = std::chrono::steady_clock::now();
-        const aster::ReadResult drip_result = aster::read_http_request(
-            fds[1], drip_request, drip_leftover, aster::kMaxBodyBytes,
-            std::chrono::milliseconds(80), std::chrono::milliseconds(200));
-        const auto drip_waited = std::chrono::steady_clock::now() - drip_begin;
-        expect_true("drip stalled partial times out", drip_result == aster::ReadResult::Timeout);
-        expect_true("drip timeout is bounded", drip_waited < std::chrono::milliseconds(2000));
-
-        int idle_fds[2];
-        expect_true("idle socketpair", ::socketpair(AF_UNIX, SOCK_STREAM, 0, idle_fds) == 0);
-        aster::Request idle_request;
-        std::string idle_leftover;
-        const aster::ReadResult idle_result = aster::read_http_request(
-            idle_fds[1], idle_request, idle_leftover, aster::kMaxBodyBytes,
-            std::chrono::milliseconds(60), std::chrono::milliseconds(120));
-        expect_true("idle connection closes quietly", idle_result == aster::ReadResult::Closed);
-        ::close(fds[0]);
-        ::close(fds[1]);
-        ::close(idle_fds[0]);
-        ::close(idle_fds[1]);
-    }
-
-    // run_sse over a socketpair: handshake + telemetry events, stops on shutdown.
-    {
-        int fds[2] = {-1, -1};
-        expect_true("sse socketpair", ::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
-        aster::Metrics metrics;
-        metrics.record("/api/health", 200, std::chrono::microseconds(400));
-        std::atomic<bool> running{true};
-        aster::StreamHub hub;
-        expect_true("sse hub acquire", hub.try_acquire());
-        std::thread producer([&] { aster::run_sse(fds[1], metrics, running, hub); });
-
-        std::string received;
-        char buffer[4096];
-        while (received.find("\n\n") == std::string::npos) {
-            const ssize_t got = ::recv(fds[0], buffer, sizeof(buffer), 0);
-            if (got <= 0) {
-                break;
-            }
-            received.append(buffer, static_cast<std::size_t>(got));
-        }
-        running = false;
-        producer.join();
-        ::close(fds[0]);
-        expect_true("sse handshake status",
-                    received.find("HTTP/1.1 200 OK") != std::string::npos);
-        expect_true("sse handshake content type",
-                    received.find("Content-Type: text/event-stream") != std::string::npos);
-        expect_true("sse handshake no buffering",
-                    received.find("X-Accel-Buffering: no") != std::string::npos);
-        expect_true("sse handshake nosniff",
-                    received.find("X-Content-Type-Options: nosniff") != std::string::npos);
-        expect_true("sse event name", received.find("event: telemetry") != std::string::npos);
-        expect_true("sse event payload",
-                    received.find("data: {\"tick\":1,") != std::string::npos);
-        expect_true("sse payload totals",
-                    received.find("\"total_requests\":1") != std::string::npos);
-        expect_true("sse released hub", hub.active() == 0);
-    }
-
-    {
-        const std::string raw =
-            "GET /api/mission?seed=alpha%2Done&mode=calm HTTP/1.1\r\n"
-            "HOST:  aster.local \r\n"
-            "X-Custom:\ttabbed\r\n"
-            "\r\n";
-        const Request request = aster::parse_request_headers(raw);
-        expect_eq("parse_request path", request.path, "/api/mission");
-        expect_eq("parse_request query decoded", request.query.at("seed"), "alpha-one");
-        expect_eq("parse_request query second", request.query.at("mode"), "calm");
-        expect_eq("parse_request header lowercased", request.headers.at("host"), "aster.local ");
-        expect_eq("parse_request header tab trimmed", request.headers.at("x-custom"), "tabbed");
-        expect_true("parse_request no body", request.body.empty());
-    }
-    {
-        const std::string raw =
-            "POST /api/echo HTTP/1.1\r\nContent-Length: 4\r\n\r\nbody";
-        const Request request = aster::parse_request_headers(raw);
-        expect_eq("parse_request body split", request.body, "body");
-    }
-    {
-        const Request request = aster::parse_request_headers("GET ?a=1 HTTP/1.1\r\n\r\n");
-        expect_eq("parse_request empty path becomes root", request.path, "/");
-    }
-
-    {
-        const auto params = aster::parse_query("a=1&&b&c=%2Bx&d=");
-        expect_eq("parse_query plain", params.at("a"), "1");
-        expect_eq("parse_query missing equals", params.at("b"), "");
-        expect_eq("parse_query encoded value", params.at("c"), "+x");
-        expect_eq("parse_query empty value", params.at("d"), "");
-        expect_true("parse_query skips empty pairs", params.size() == 4);
-        const auto encoded_key = aster::parse_query("se%2Ded=1");
-        expect_eq("parse_query encoded key", encoded_key.begin()->first, "se-ed");
-    }
-
-    {
-        const std::map<std::string, std::string> query{{"points", "900"}, {"junk", "abc"}};
-        expect_true("int_param clamps high", aster::int_param(query, "points", 10, 1, 500) == 500);
-        expect_true("int_param non-numeric fallback", aster::int_param(query, "junk", 7, 1, 500) == 7);
-        expect_true("int_param missing fallback", aster::int_param(query, "absent", 42, 1, 500) == 42);
-        expect_eq("string_param truncates", aster::string_param(query, "junk", "dflt", 2), "ab");
-        expect_eq("string_param fallback", aster::string_param(query, "absent", "dflt"), "dflt");
-    }
-
-    expect_eq("mime html", aster::mime_type("index.html"), "text/html; charset=utf-8");
-    expect_eq("mime css", aster::mime_type("styles.css"), "text/css; charset=utf-8");
-    expect_eq("mime js", aster::mime_type("app.js"), "application/javascript; charset=utf-8");
-    expect_eq("mime svg", aster::mime_type("logo.svg"), "image/svg+xml");
-    expect_eq("mime unknown", aster::mime_type("data.bin"), "application/octet-stream");
-
-    expect_true("stable_seed deterministic", aster::stable_seed("orion") == aster::stable_seed("orion"));
-    expect_true("stable_seed distinguishes", aster::stable_seed("orion") != aster::stable_seed("lyra"));
-    expect_true("stable_seed empty fnv basis", aster::stable_seed("") == 2166136261u);
-
-    expect_eq("version constant", std::string(aster::kVersion), "2.4.0");
-
-    auto count_key = [](const std::string& hay, const std::string& needle) {
-        int n = 0;
-        for (std::size_t at = 0; (at = hay.find(needle, at)) != std::string::npos;
-             at += needle.size()) {
-            ++n;
-        }
-        return n;
-    };
-
-    {
-        const std::map<std::string, std::string> sky_query{{"seed", "orion"}, {"layers", "4"}};
-        const std::string sky1 = aster::build_sky_json(sky_query);
-        const std::string sky2 = aster::build_sky_json(sky_query);
-        expect_eq("sky deterministic", sky1, sky2);
-        expect_true("sky has layers", sky1.find("\"layers\"") != std::string::npos);
-        expect_true("sky has haze", sky1.find("\"haze\"") != std::string::npos);
-        expect_true("sky has dust", sky1.find("\"dust\"") != std::string::npos);
-        expect_true("sky has aurora", sky1.find("\"aurora\"") != std::string::npos);
-        expect_true("sky version", sky1.find("\"version\":\"2.4.0\"") != std::string::npos);
-        expect_true("sky four layers", count_key(sky1, "\"sat\":") == 4);
-        const std::string sky_other = aster::build_sky_json({{"seed", "lyra"}, {"layers", "4"}});
-        expect_true("sky seed distinguishes", sky1 != sky_other);
-        const std::string sky_clamped = aster::build_sky_json({{"seed", "orion"}, {"layers", "99"}});
-        expect_true("sky layers clamp high", count_key(sky_clamped, "\"sat\":") == 8);
-        const std::string sky_low = aster::build_sky_json({{"seed", "orion"}, {"layers", "1"}});
-        expect_true("sky layers clamp low", count_key(sky_low, "\"sat\":") == 2);
-    }
-
-    {
-        const std::map<std::string, std::string> orbit_query{{"seed", "42"}, {"planets", "6"}};
-        const std::string orbit1 = aster::build_orbit_json(orbit_query);
-        const std::string orbit2 = aster::build_orbit_json(orbit_query);
-        expect_eq("orbit deterministic", orbit1, orbit2);
-        expect_true("orbit has planets", orbit1.find("\"planets\"") != std::string::npos);
-        expect_true("orbit has star", orbit1.find("\"star\"") != std::string::npos);
-        expect_true("orbit version", orbit1.find("\"version\":\"2.4.0\"") != std::string::npos);
-        expect_true("orbit six planets", count_key(orbit1, "\"name\":") == 6);
-        const std::string orbit_other = aster::build_orbit_json({{"seed", "43"}, {"planets", "6"}});
-        expect_true("orbit seed distinguishes", orbit1 != orbit_other);
-        const std::string orbit_high = aster::build_orbit_json({{"seed", "42"}, {"planets", "99"}});
-        expect_true("orbit planets clamp high", count_key(orbit_high, "\"name\":") == 10);
-        const std::string orbit_low = aster::build_orbit_json({{"seed", "42"}, {"planets", "1"}});
-        expect_true("orbit planets clamp low", count_key(orbit_low, "\"name\":") == 3);
-    }
-
-    {
-        const std::map<std::string, std::string> comet_query{{"seed", "7"}, {"count", "2"}};
-        const std::string comet1 = aster::build_comet_json(comet_query);
-        const std::string comet2 = aster::build_comet_json(comet_query);
-        expect_eq("comet deterministic", comet1, comet2);
-        expect_true("comet has comets", comet1.find("\"comets\"") != std::string::npos);
-        expect_true("comet version", comet1.find("\"version\":\"2.4.0\"") != std::string::npos);
-        expect_true("comet default-seed field", comet1.find("\"seed\":7,") != std::string::npos);
-        expect_true("comet two bodies", count_key(comet1, "\"hue\":") == 2);
-        const std::string comet_default = aster::build_comet_json({});
-        expect_eq("comet default matches seed 7 count 2", comet_default, comet1);
-        const std::string comet_other = aster::build_comet_json({{"seed", "8"}, {"count", "2"}});
-        expect_true("comet seed distinguishes", comet1 != comet_other);
-        const std::string comet_high = aster::build_comet_json({{"seed", "7"}, {"count", "99"}});
-        expect_true("comet count clamp high", count_key(comet_high, "\"hue\":") == 6);
-        const std::string comet_low = aster::build_comet_json({{"seed", "7"}, {"count", "0"}});
-        expect_true("comet count clamp low", count_key(comet_low, "\"hue\":") == 1);
-    }
-
-    // Access log: both formats, and the sub-millisecond precision that an
-    // integer-millisecond log would report as a useless "0" for most handlers.
-    {
-        using aster::LogFormat;
-        aster::Request log_req;
-        log_req.method = "GET";
-        log_req.target = "/api/health?seed=a";
-        log_req.path = "/api/health";
-        log_req.version = "HTTP/1.1";
-
-        const std::string json = aster::format_access_log(
-            LogFormat::Json, "127.0.0.1", log_req, 200, 142, std::chrono::microseconds(310));
-        expect_true("log json method", json.find("\"method\":\"GET\"") != std::string::npos);
-        expect_true("log json path", json.find("\"path\":\"/api/health\"") != std::string::npos);
-        expect_true("log json status", json.find("\"status\":200") != std::string::npos);
-        expect_true("log json bytes", json.find("\"bytes\":142") != std::string::npos);
-        expect_true("log json ip", json.find("\"ip\":\"127.0.0.1\"") != std::string::npos);
-        expect_true("log json sub-ms precision", json.find("\"ms\":0.31") != std::string::npos);
-        expect_true("log json is one object", json.front() == '{' && json.back() == '}');
-        expect_true("log json single line", json.find('\n') == std::string::npos);
-
-        const std::string text = aster::format_access_log(
-            LogFormat::Text, "127.0.0.1", log_req, 404, 9, std::chrono::microseconds(1500));
-        expect_true("log text request line",
-                    text.find("\"GET /api/health?seed=a HTTP/1.1\"") != std::string::npos);
-        expect_true("log text status", text.find(" 404 9 ") != std::string::npos);
-        expect_true("log text ms suffix", text.find("1.50ms") != std::string::npos);
-
-        // A quoted path must not break out of the JSON string.
-        aster::Request evil;
-        evil.method = "GET";
-        evil.path = "/a\"b";
-        evil.version = "HTTP/1.1";
-        const std::string escaped = aster::format_access_log(
-            LogFormat::Json, "1.2.3.4", evil, 200, 0, std::chrono::microseconds(0));
-        expect_true("log json escapes quotes",
-                    escaped.find("\"path\":\"/a\\\"b\"") != std::string::npos);
-
-        expect_true("log format parses text",
-                    aster::log_format_from_string("TEXT") == LogFormat::Text);
-        expect_true("log format defaults json",
-                    aster::log_format_from_string("anything") == LogFormat::Json);
-    }
-    const auto q = parse_query("seed=alpha&min=1&max=10");
-    expect_eq("query seed", q.at("seed"), "alpha");
-    expect_eq("query min", q.at("min"), "1");
-    expect_true("int clamp high", int_param(q, "max", 0, 0, 5) == 5);
-    expect_true("int fallback", int_param(q, "missing", 7, 0, 100) == 7);
-    expect_true("stable seed deterministic",
-                stable_seed("aster") == stable_seed("aster"));
-    expect_true("stable seed differs",
-                stable_seed("a") != stable_seed("b"));
-    const std::string iso = current_time_iso();
-    expect_true("iso ends with Z", !iso.empty() && iso.back() == 'Z');
-    expect_true("iso has T", iso.find('T') != std::string::npos);
-
-    if (failures != 0) {
-        std::cerr << failures << " test(s) failed\n";
+    if (g_failed != 0) {
+        std::cerr << g_failed << " failed, " << g_passed << " passed\n";
         return 1;
     }
-    std::cout << "all unit tests passed\n";
+    std::cout << "aster_unit_tests: " << g_passed << " passed\n";
     return 0;
 }

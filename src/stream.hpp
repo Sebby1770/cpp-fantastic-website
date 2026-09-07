@@ -3,82 +3,146 @@
 #include "http.hpp"
 #include "metrics.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <sstream>
+#include <condition_variable>
+#include <mutex>
 #include <string>
 #include <thread>
-
-#include <unistd.h>
+#include <utility>
+#include <vector>
 
 namespace aster {
 
-inline constexpr int kMaxStreamClients = 32;
-
-// Tracks how many Server-Sent Events clients are connected. Streams run on
-// detached threads (they must not occupy pool workers), so an atomic counter
-// is the only shared state: try_acquire() caps concurrency, release() must be
-// called exactly once per successful acquire.
-class StreamHub {
+class SseHub {
 public:
-    bool try_acquire() {
-        int current = active_.load(std::memory_order_relaxed);
-        while (current < kMaxStreamClients) {
-            if (active_.compare_exchange_weak(current, current + 1,
-                                              std::memory_order_acq_rel)) {
-                return true;
-            }
+    SseHub(Metrics* metrics, std::atomic<bool>* running, int max_clients)
+        : metrics_(metrics), running_(running), max_clients_(max_clients < 1 ? 1 : max_clients) {}
+
+    ~SseHub() { stop(); }
+
+    SseHub(const SseHub&) = delete;
+    SseHub& operator=(const SseHub&) = delete;
+
+    void start(std::chrono::steady_clock::time_point started) {
+        started_ = started;
+        thread_ = std::thread([this] { run(); });
+    }
+
+    bool try_reserve() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (static_cast<int>(clients_.size()) + reserved_ >= max_clients_) {
+            return false;
         }
-        return false;
+        ++reserved_;
+        return true;
     }
 
-    void release() {
-        active_.fetch_sub(1, std::memory_order_acq_rel);
+    void cancel_reserve() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (reserved_ > 0) {
+            --reserved_;
+        }
     }
 
-    int active() const {
-        return active_.load(std::memory_order_acquire);
+    bool attach(int fd) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (reserved_ > 0) {
+            --reserved_;
+        }
+        if (static_cast<int>(clients_.size()) >= max_clients_) {
+            return false;
+        }
+        clients_.push_back(fd);
+        const std::string first = format_event();
+        if (!send_all(fd, first, 5000)) {
+            clients_.pop_back();
+            return false;
+        }
+        return true;
+    }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stop_) {
+                return;
+            }
+            stop_ = true;
+        }
+        cv_.notify_all();
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (int fd : clients_) {
+            UniqueFd closer(fd);
+        }
+        clients_.clear();
     }
 
 private:
-    std::atomic<int> active_{0};
-};
+    std::string format_event() const {
+        long long uptime = 0;
+        if (started_.time_since_epoch().count() != 0) {
+            uptime = std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::steady_clock::now() - started_)
+                         .count();
+        }
+        const std::string data = metrics_ ? metrics_->telemetry_json(uptime)
+                                          : "{\"requests\":0,\"p99\":0,\"2xx\":0,\"4xx\":0,\"5xx\":0,"
+                                            "\"uptime_seconds\":0}";
+        return "retry: 1000\nevent: telemetry\ndata: " + data + "\n\n";
+    }
 
-// Serve one SSE connection: write the handshake, then push a telemetry event
-// every second until the client disconnects (send_all fails; SO_SNDTIMEO
-// bounds blocking) or the server begins shutting down. The 1 s wait is sliced
-// into 250 ms checks of `running` so graceful shutdown never stalls behind an
-// open stream. Owns `client_fd` and closes it; releases `hub` on exit.
-inline void run_sse(int client_fd, Metrics& metrics, std::atomic<bool>& running,
-                    StreamHub& hub) {
-    const std::string handshake =
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: text/event-stream\r\n"
-        "Cache-Control: no-store\r\n"
-        "Connection: keep-alive\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
-        "X-Content-Type-Options: nosniff\r\n"
-        "X-Accel-Buffering: no\r\n"
-        "\r\n";
-    if (send_all(client_fd, handshake)) {
-        std::uint64_t tick = 0;
-        while (running.load()) {
-            ++tick;
-            std::ostringstream event;
-            event << "event: telemetry\ndata: " << metrics.snapshot_json(tick) << "\n\n";
-            if (tick % 15 == 0) {
-                event << ": keep-alive\n\n";
-            }
-            if (!send_all(client_fd, event.str())) {
+    void run() {
+        for (;;) {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_.wait_for(lock, std::chrono::seconds(1), [this] {
+                return stop_ || (running_ != nullptr && !running_->load());
+            });
+            if (stop_ || (running_ != nullptr && !running_->load())) {
                 break;
             }
-            for (int slice = 0; slice < 4 && running.load(); ++slice) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            const std::string payload = format_event();
+            const std::vector<int> snapshot = clients_;
+            lock.unlock();
+
+            std::vector<int> dead;
+            for (int fd : snapshot) {
+                if (!send_all(fd, payload, 4000)) {
+                    dead.push_back(fd);
+                }
             }
+            if (dead.empty()) {
+                continue;
+            }
+
+            lock.lock();
+            std::vector<int> next;
+            next.reserve(clients_.size());
+            for (int fd : clients_) {
+                if (std::find(dead.begin(), dead.end(), fd) != dead.end()) {
+                    UniqueFd closer(fd);
+                } else {
+                    next.push_back(fd);
+                }
+            }
+            clients_.swap(next);
         }
     }
-    ::close(client_fd);
-    hub.release();
-}
+
+    Metrics* metrics_ = nullptr;
+    std::atomic<bool>* running_ = nullptr;
+    int max_clients_ = 16;
+    std::chrono::steady_clock::time_point started_{};
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::vector<int> clients_;
+    int reserved_ = 0;
+    bool stop_ = false;
+    std::thread thread_;
+};
 
 }  // namespace aster

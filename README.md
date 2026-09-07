@@ -1,25 +1,17 @@
-# C++ Fantastic Website
+# AsterForge Observatory 3.1
 
-**AsterForge** is a polished interactive web app served by a native **C++17** HTTP server. The backend generates live mission data, color palettes, constellation geometry, nebula skyboxes, orbital systems, and streaming request telemetry — with zero runtime framework dependencies (POSIX sockets only).
-
-**Version: 2.4.0**
+AsterForge is a live mission-control observatory served by a native C++17 POSIX HTTP server. Zero third-party C++ libraries. The backend forges seeded mission packets, sky layers, orbital systems, and telemetry; the browser renders a flyable WebGL sky.
 
 ## Highlights
 
-- **Real HTTP engine** — bounded worker thread pool, HTTP/1.1 keep-alive with pipelining carry-over, per-socket read/write timeouts, graceful shutdown on `SIGINT`/`SIGTERM`
-- **Hardened parsing** — 64 KiB header cap (`431`), strict `Content-Length` validation, oversized bodies rejected without reading them (`413`), malformed requests → `400`, `405` with `Allow`
-- **Static-file caching** — strong FNV-1a `ETag` + `Last-Modified` + `Cache-Control: public, max-age=300`; conditional `If-None-Match` / `If-Modified-Since` → `304` (APIs stay `no-store`)
-- **Range requests** — `Accept-Ranges: bytes` plus single-range `Range` support (`start-end`, `start-`, `-suffix`) → `206 Partial Content` with `Content-Range`, or `416` when unsatisfiable
-- **Transparent gzip** — serves a pre-built `<file>.gz` sidecar when the client sends `Accept-Encoding: gzip` (honoring `q=0`), with a distinct representation `ETag` and `Vary: Accept-Encoding`; zero runtime CPU, still dependency-free
-- **Traversal defense** — canonical-path containment (symlink escapes and NUL bytes rejected)
-- **Per-IP rate limiting** — token bucket (`--rate-limit`), `429` + `Retry-After`
-- **Live telemetry** — `GET /api/stream` Server-Sent Events pushing metrics snapshots every second; deep metrics with status-class counters and latency `mean`/`max`/`p50`/`p99`
-- **Structured access log** — JSON by default (`--log-format json|text`), one object per request with time, IP, method, path, status, bytes and sub-millisecond latency; mutex-serialized and flushed per line so `tail -f` works on a live server
-- **Frontend workspace** — living orrery (orbiting planets, nebula skybox, aurora, dust, comets) plus constellation, planet inspect, time scale, warp, SSE telemetry, keyboard shortcuts (`c` / `o` / `w` / `?`), `prefers-reduced-motion` support, mobile layout
-- **GitHub Pages demo** — `public/` is published statically; in-browser generators keep sky / orbit / constellation interactive when the C++ APIs are absent
-- **Quality gates** — 100+ unit tests, end-to-end smoke suite, CI matrix (g++/clang++) plus an ASan+UBSan job
+- Header-split C++17 server: thread pool, per-IP token bucket, keep-alive, Range/ETag static files, SSE hub
+- Generative JSON: `/api/mission` nodes include `x,y,z` plus energy, phase, and kind
+- Six modes: orbit, bloom, forge, night, pulse, drift
+- WebGL observatory (Three.js r160 CDN) with slow auto-orbit and canvas 3D fallback
+- SSE telemetry strip when the C++ server is present; GitHub Pages uses in-browser generators
+- Shareable URL state for `seed`, `mode`, `intensity`, `tempo`, and `density`
 
-## Run Locally
+## Run locally
 
 ```bash
 cmake -S . -B build
@@ -27,184 +19,89 @@ cmake --build build
 ./build/cpp_fantastic_website --port 8080
 ```
 
-Optional flags:
+Open `http://localhost:8080`.
 
-| Flag | Description |
-|------|-------------|
-| `--port N` | Listen port (default `8080`, clamped 1024–65535) |
-| `--threads N` | Worker pool size (default: hardware concurrency, clamped 2–32) |
-| `--max-body BYTES` | Max request body size (default 1 MiB; larger → `413`) |
-| `--rate-limit N` | Sustained requests/sec per IP (default `50`, `0` disables) |
-| `--log-format json\|text` | Access-log format (default `json`) |
-| `--quiet` / `-q` | Disable per-request access logging |
-| `--help` / `-h` | Show usage |
+### CLI flags
 
-Then open:
-
-```text
-http://localhost:8080
-```
+| Flag | Default | Notes |
+| --- | --- | --- |
+| `--port` | `8080` | Clamped to 1024–65535 |
+| `--threads` | hardware concurrency | Clamped to 2–32 |
+| `--max-body` | `1048576` | POST body limit in bytes |
+| `--rate-limit` | `50` | Per-IP requests/second; `0` disables |
+| `--log-format` | `json` | `json` or `text` |
+| `--quiet` | off | Suppress access log |
+| `--help` |  | Print usage |
 
 ## HTTP API
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/health` | Liveness: `status`, `version`, `uptime_seconds`, `request_count` |
-| `GET` | `/api/version` | Service metadata + endpoint list |
-| `GET` | `/api/time` | ISO-8601 UTC + unix timestamp |
-| `GET` | `/api/random` | Deterministic seeded random int (`seed`, `min`, `max`) |
-| `GET` | `/api/status` | Richer health snapshot (`public_dir`, `port`, `uptime`, `request_count`) |
-| `GET` | `/api/mission` | Mission packet (seed, mode, intensity, tempo, optional `palette`) |
-| `GET` | `/api/palettes` | Named color palettes |
-| `GET` | `/api/constellation` | Star points for the canvas (`seed`, `points`) |
-| `GET` | `/api/sky` | Deterministic nebula / skybox (`seed` string, `layers` 2–8) |
-| `GET` | `/api/orbit` | Deterministic miniature solar system (`seed` int, `planets` 3–10) |
-| `GET` | `/api/comet` | Deterministic comet streaks (`seed` int default 7, `count` 1–6 default 2) |
-| `GET` | `/api/metrics` | `total_requests`, `by_path`, `uptime_seconds`, status classes (`2xx`–`5xx`), `latency_ms` (`count`/`mean`/`max`/`p50`/`p99`) |
-| `GET` | `/api/stream` | Server-Sent Events telemetry (`event: telemetry` every 1 s; max 32 concurrent streams, over cap → `503`) |
-| `POST` | `/api/echo` | Echo JSON body back (demo / Content-Length parsing) |
-| `HEAD` | any GET route | Headers only (body length advertised, no body sent) |
-| `OPTIONS` | any | CORS preflight (`204`) |
+| Method | Path | Notes |
+| --- | --- | --- |
+| GET/HEAD | `/api/health` | `status`, `service`, `language`, `version` `3.1.0`, `uptime_seconds`, `request_count` |
+| GET/HEAD | `/api/version` | Version plus endpoint list |
+| GET/HEAD | `/api/presets` | Six named missions |
+| GET/HEAD | `/api/mission` | Query: `seed`, `mode`, `intensity`, `tempo`, `density` |
+| GET/HEAD | `/api/share` | `shortId` plus share path |
+| GET/HEAD | `/api/sky` | Nebula layers (`seed`, `layers`) |
+| GET/HEAD | `/api/orbit` | Planets and moons (`seed`, `planets`) |
+| GET/HEAD | `/api/constellation` | Named points (`seed`, `points`) |
+| GET/HEAD | `/api/catalog` | Palettes and modes |
+| GET/HEAD | `/api/metrics` | Totals, `by_path`, latency p50/p99, status classes |
+| GET | `/api/stream` | `text/event-stream`, `event: telemetry` |
+| POST | `/api/echo` | Echoes the JSON body |
+| OPTIONS | `*` | `204` CORS |
 
-Status behaviors: `206` + `Content-Range` for satisfiable `Range` requests, `304` conditional static hits, `400` malformed, `404` unknown path, `405` + `Allow` for unsupported methods, `408` request timeout, `413` oversized body, `416` unsatisfiable range, `429` + `Retry-After` when rate-limited, `431` oversized headers, `503` over the SSE stream cap.
-
-### Mission query parameters
-
-| Param | Default | Notes |
-|-------|---------|-------|
-| `seed` | `sebby` | String seed for deterministic generation |
-| `mode` | `pulse` | `pulse` / `route` / `forge` |
-| `intensity` | `68` | 1–100 |
-| `tempo` | `42` | 1–100 |
-| `palette` | _(mode-based)_ | Palette id from `/api/palettes` (e.g. `ember`) |
-
-### Constellation query parameters
-
-| Param | Default | Notes |
-|-------|---------|-------|
-| `seed` | `42` | Integer seed |
-| `points` | `24` | 4–128 star count |
-
-### Sky query parameters
-
-| Param | Default | Notes |
-|-------|---------|-------|
-| `seed` | `sebby` | String seed (`stable_seed` → `mt19937`) |
-| `layers` | `4` | 2–8 nebula layers |
-
-### Orbit query parameters
-
-| Param | Default | Notes |
-|-------|---------|-------|
-| `seed` | `42` | Integer seed |
-| `planets` | `6` | 3–10 planet count |
-
-### Comet query parameters
-
-| Param | Default | Notes |
-|-------|---------|-------|
-| `seed` | `7` | Integer seed |
-| `count` | `2` | 1–6 comet count |
-
-### Example requests
-
-```bash
-curl -s http://localhost:8080/api/health
-# {"status":"ok","service":"AsterForge","language":"C++17","version":"2.4.0",...}
-
-curl -s "http://localhost:8080/api/constellation?seed=7&points=12"
-curl -s "http://localhost:8080/api/sky?seed=orion&layers=5"
-curl -s "http://localhost:8080/api/orbit?seed=42&planets=6"
-curl -s "http://localhost:8080/api/comet?seed=7&count=2"
-curl -s -X POST http://localhost:8080/api/echo -H 'Content-Type: application/json' -d '{"ping":1}'
-
-# Live telemetry stream (SSE)
-curl -N http://localhost:8080/api/stream
-
-# Conditional GET → 304
-ETAG=$(curl -sI http://localhost:8080/ | tr -d '\r' | awk 'tolower($1)=="etag:" {print $2}')
-curl -s -o /dev/null -w '%{http_code}\n' -H "If-None-Match: $ETAG" http://localhost:8080/
-```
-
-All responses include:
-
-- `X-Content-Type-Options: nosniff`
-- `Access-Control-Allow-Origin: *` (local-dev friendly)
+Static files use `Cache-Control: public, max-age=300`, ETag / Last-Modified (`304`), and byte ranges (`206` / `416`). APIs are `no-store`. Path traversal is rejected with `400`.
 
 ## Frontend
 
-The orrery workspace in `public/` consumes the SSE stream for a live telemetry dashboard (request totals, status classes, latency percentiles) and renders a nebula skybox, dust, an aurora ribbon, a glowing star with revolving planets and moons, comet streaks, constellation links in the background, shooting stars, and warp mode. Click a planet to inspect name, orbit, period, moons, and ring. Time scale buttons (0.25× / 1× / 4×) multiply orbital speed. Keyboard shortcuts are listed in-app (`?`); warp toggles with `w`, the orbital system with `o`, comets with `c`. Ambient animation honors `prefers-reduced-motion` (orbital angles freeze).
+`public/` is a no-build observatory:
 
-When `/api/sky`, `/api/orbit`, `/api/comet`, `/api/constellation`, or `/api/mission` are missing (GitHub Pages, offline), matching in-browser generators produce the same JSON shapes so the demo stays interactive.
+- Orbit camera with inertia (Three.js `OrbitControls`)
+- Starfield, nebula sprites from `/api/sky`, glowing 3D constellation from mission nodes
+- Optional `/api/orbit` overlay, time scale `0.25x / 1x / 4x`
+- Click a node for intel; snapshots, copy JSON, copy link, PNG from `renderer.domElement.toDataURL`
+- Keys: `?` help, `g` generate, `r` randomize, `1–6` modes
+- `prefers-reduced-motion` freezes orbits
+- Relative assets (`./styles.css`, `./app.js`) so GitHub Pages works
+- If `/api/*` is missing, the UI synthesizes matching JSON locally and hides SSE
 
 ## Tests
 
 ```bash
-# Full smoke suite (build + unit + live HTTP checks)
+cmake -S . -B build && cmake --build build
+./build/aster_unit_tests
 ./tests/smoke.sh
-
-# Unit tests only
-cmake -S . -B build && cmake --build build && ./build/aster_unit_tests
-
-# ctest wrapper
-ctest --test-dir build --output-on-failure
 ```
 
-The smoke suite builds the server, starts it on port `8097` (override with `PORT=`), and exercises: health/mission/palettes/constellation/sky/orbit/comet/echo APIs, HEAD/OPTIONS, security headers, keep-alive reuse, oversized-body `413`, header-cap `431`, 50-way concurrency, ETag/`304` conditional GETs, `Range` requests (`206`/`Content-Range`/`416`), gzip sidecar negotiation, path-traversal probes, per-IP `429` rate limiting, `405` `Allow`, echo JSON validity, SSE streaming, access-log format (JSON parsed and field-checked, plus `--log-format text`), and graceful shutdown (including with an open SSE stream) with exit code `0`.
+`aster_unit_tests` covers decode/escape, query parsing, FNV seed determinism, mission JSON, path containment, integer clamp, and Range parsing. `tests/smoke.sh` builds both binaries, hits the API surface, and checks HEAD, OPTIONS, traversal, echo, 405 Allow, SSE, 304, Range, and 429.
 
-CI runs the full suite under g++ and clang++, plus a dedicated ASan+UBSan job.
+CI (`.github/workflows/ci.yml`) runs the same sequence on Ubuntu.
 
-## Project Layout
+## Layout
 
 ```text
 .
 |-- CMakeLists.txt
-|-- public/                 # Static frontend
+|-- public
 |   |-- app.js
 |   |-- index.html
 |   `-- styles.css
-|-- src/
-|   |-- main.cpp            # Thin entry + signals
-|   |-- http.hpp            # Request / Response / parse / send / limits
-|   |-- log.hpp             # Mutex-serialized access log (JSON / text)
-|   |-- metrics.hpp         # Thread-safe counters + latency ring
-|   |-- mission.hpp         # Mission, palettes, constellation, sky, orbit, comet JSON
-|   |-- rate_limiter.hpp    # Per-IP token bucket
-|   |-- server.hpp          # Server class, routing, static cache, CLI
-|   |-- stream.hpp          # SSE hub + telemetry stream threads
-|   |-- thread_pool.hpp     # Bounded worker pool
-|   `-- util.hpp            # url_decode, json_escape, http_date, ETag hash
-|-- tests/
-|   |-- smoke.sh
-|   `-- unit_tests.cpp
-`-- .github/workflows/
-    |-- ci.yml
-    `-- pages.yml           # Publishes public/ to GitHub Pages
+|-- src
+|   |-- http.hpp
+|   |-- json.hpp
+|   |-- log.hpp
+|   |-- main.cpp
+|   |-- metrics.hpp
+|   |-- mission.hpp
+|   |-- rate_limiter.hpp
+|   |-- server.hpp
+|   |-- stream.hpp
+|   |-- thread_pool.hpp
+|   `-- util.hpp
+`-- tests
+    |-- smoke.sh
+    `-- unit_tests.cpp
 ```
 
-## GitHub Pages
-
-A static copy of `public/` is published by `.github/workflows/pages.yml`
-(`peaceiris/actions-gh-pages@v4`, `publish_dir: ./public`) on pushes to `main`.
-Asset paths in `index.html` are relative (`./styles.css`, `./app.js`) so they
-work both at the C++ server root and at a project Pages URL such as
-`/cpp-fantastic-website/`. Without the native binary the UI falls back to
-in-browser generators for sky, orbit, comet, constellation, palettes, and mission.
-
-## Architecture
-
-```text
-            ┌─ SIGINT/SIGTERM ──► running=false ─ drain pool ─ wait streams ─┐
-            │                                                                ▼
-Client ──► accept (poll, shutdown-aware) ──► ThreadPool worker               exit 0
-              │                                   │
-              │                     keep-alive loop (timeouts, pipelining)
-              │                                   │
-              │                        ┌── RateLimiter (per-IP bucket)
-              │                        ├── route → APIs | static (ETag/304)
-              │                        ├── GET /api/stream ──► detached SSE thread
-              │                        ├── Metrics::record (status class + latency)
-              │                        └── send_response + access log
-```
-
-Version: **2.4.0**
+The CMake target remains `cpp_fantastic_website`.

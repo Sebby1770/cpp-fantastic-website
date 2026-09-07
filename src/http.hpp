@@ -3,42 +3,25 @@
 #include "util.hpp"
 
 #include <cerrno>
-#include <chrono>
-#include <cstdlib>
+#include <cstring>
 #include <map>
-#include <sstream>
+#include <poll.h>
 #include <string>
+#include <sys/socket.h>
 #include <utility>
 #include <vector>
 
-#include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
 namespace aster {
-
-inline constexpr std::size_t kMaxHeaderBytes = 64 * 1024;
-inline constexpr std::size_t kMaxBodyBytes = 1024 * 1024;
-inline constexpr int kMaxRequestsPerConn = 100;
-// Longest silence tolerated while waiting for (more of) a request. An idle
-// keep-alive connection is closed quietly; a stalled partial request gets 408.
-inline constexpr std::chrono::milliseconds kIdleTimeoutDefault{5000};
-// Wall-clock budget for reading one complete request. Unlike SO_RCVTIMEO
-// (which a slow-drip client resets with every byte), this bounds the whole
-// read, so a slowloris-style client cannot pin a pool worker indefinitely.
-inline constexpr std::chrono::milliseconds kRequestDeadlineDefault{10000};
-// kVersion now lives in util.hpp (included above) so every module shares one
-// definition; the 1.2 line kept its own copy here.
-
 
 struct Request {
     std::string method;
     std::string target;
     std::string path;
-    std::string version;
+    std::string version = "HTTP/1.1";
     std::map<std::string, std::string> query;
     std::map<std::string, std::string> headers;
     std::string body;
+    std::string ip = "127.0.0.1";
 };
 
 struct Response {
@@ -46,379 +29,10 @@ struct Response {
     std::string status_text = "OK";
     std::string content_type = "text/plain; charset=utf-8";
     std::string body;
-    bool include_body = true;
     std::vector<std::pair<std::string, std::string>> extra_headers;
+    bool close = false;
+    bool take_socket = false;
 };
-
-// Outcome of reading one request off a connection.
-enum class ReadResult { Ok, Closed, Timeout, Malformed, HeadersTooLarge, BodyTooLarge };
-
-// Outcome of attempting to parse one request from an in-memory buffer.
-enum class ParseState { NeedMore, Complete, Malformed, HeadersTooLarge, BodyTooLarge };
-
-// Classification of a Content-Length header against the configured body limit.
-enum class ContentLengthClass { Ok, TooLarge, Malformed };
-
-struct ContentLengthInfo {
-    ContentLengthClass status = ContentLengthClass::Ok;
-    std::size_t length = 0;
-};
-
-inline bool send_all(int socket_fd, const std::string& payload) {
-    const char* data = payload.data();
-    std::size_t remaining = payload.size();
-    while (remaining > 0) {
-        const ssize_t sent = ::send(socket_fd, data, remaining, 0);
-        if (sent < 0 && errno == EINTR) {
-            continue;
-        }
-        if (sent <= 0) {
-            return false;
-        }
-        data += sent;
-        remaining -= static_cast<std::size_t>(sent);
-    }
-    return true;
-}
-
-// Strict Content-Length parsing: absent means "no body"; anything non-numeric,
-// negative, or with trailing garbage is Malformed; larger than max_bytes is
-// TooLarge (the body must be rejected without reading it).
-inline ContentLengthInfo classify_content_length(const std::map<std::string, std::string>& headers,
-                                                 std::size_t max_bytes) {
-    const auto it = headers.find("content-length");
-    if (it == headers.end()) {
-        return {ContentLengthClass::Ok, 0};
-    }
-    const std::string& value = it->second;
-    std::string trimmed = value;
-    while (!trimmed.empty() && (trimmed.back() == ' ' || trimmed.back() == '\t')) {
-        trimmed.pop_back();
-    }
-    if (trimmed.empty() || trimmed.size() > 19) {
-        return {ContentLengthClass::Malformed, 0};
-    }
-    unsigned long long parsed = 0;
-    for (const char ch : trimmed) {
-        if (ch < '0' || ch > '9') {
-            return {ContentLengthClass::Malformed, 0};
-        }
-        parsed = parsed * 10 + static_cast<unsigned long long>(ch - '0');
-    }
-    if (parsed > max_bytes) {
-        return {ContentLengthClass::TooLarge, static_cast<std::size_t>(parsed)};
-    }
-    return {ContentLengthClass::Ok, static_cast<std::size_t>(parsed)};
-}
-
-// Keep-alive decision per HTTP/1.x semantics (case-insensitive header value).
-// A single inclusive byte range, as used by `Content-Range`.
-struct ByteRange {
-    std::size_t start = 0;
-    std::size_t end = 0;  // inclusive
-    std::size_t length() const { return end - start + 1; }
-};
-
-// Outcome of parsing a `Range` header against a representation of `size` bytes.
-enum class RangeResult {
-    None,           // absent or not a form we honor -> serve the whole body (200)
-    Ok,             // satisfiable single range -> 206
-    Unsatisfiable,  // syntactically valid but outside the representation -> 416
-};
-
-// Parse a single-range `Range: bytes=...` header per RFC 9110 §14.
-//
-// Supports `start-end`, `start-` (open-ended) and `-suffix` (last N bytes).
-// Multi-range requests are deliberately *not* honored — a server may ignore a
-// Range it does not support, so those fall back to a normal 200 rather than
-// forcing a multipart/byteranges body.
-inline RangeResult parse_byte_range(const std::string& value, std::size_t size, ByteRange& out) {
-    const std::string prefix = "bytes=";
-    if (value.size() <= prefix.size() || value.compare(0, prefix.size(), prefix) != 0) {
-        return RangeResult::None;
-    }
-    std::string spec = value.substr(prefix.size());
-    // Trim surrounding whitespace.
-    while (!spec.empty() && (spec.front() == ' ' || spec.front() == '\t')) spec.erase(spec.begin());
-    while (!spec.empty() && (spec.back() == ' ' || spec.back() == '\t')) spec.pop_back();
-    if (spec.find(',') != std::string::npos) {
-        return RangeResult::None;  // multi-range: ignore, serve the full body
-    }
-    const std::size_t dash = spec.find('-');
-    if (dash == std::string::npos) {
-        return RangeResult::None;
-    }
-
-    const std::string first = spec.substr(0, dash);
-    const std::string last = spec.substr(dash + 1);
-    const auto all_digits = [](const std::string& s) {
-        return !s.empty() && s.find_first_not_of("0123456789") == std::string::npos;
-    };
-
-    // A zero-length representation cannot satisfy any range.
-    if (size == 0) {
-        return RangeResult::Unsatisfiable;
-    }
-
-    if (first.empty()) {
-        // Suffix form: `-N` means the final N bytes.
-        if (!all_digits(last)) {
-            return RangeResult::None;
-        }
-        unsigned long long suffix = std::strtoull(last.c_str(), nullptr, 10);
-        if (suffix == 0) {
-            return RangeResult::Unsatisfiable;
-        }
-        if (suffix > size) {
-            suffix = size;
-        }
-        out.start = size - static_cast<std::size_t>(suffix);
-        out.end = size - 1;
-        return RangeResult::Ok;
-    }
-
-    if (!all_digits(first)) {
-        return RangeResult::None;
-    }
-    const unsigned long long start = std::strtoull(first.c_str(), nullptr, 10);
-    if (start >= size) {
-        return RangeResult::Unsatisfiable;
-    }
-
-    unsigned long long end = size - 1;
-    if (!last.empty()) {
-        if (!all_digits(last)) {
-            return RangeResult::None;
-        }
-        end = std::strtoull(last.c_str(), nullptr, 10);
-        if (end < start) {
-            return RangeResult::Unsatisfiable;
-        }
-        if (end > size - 1) {
-            end = size - 1;
-        }
-    }
-    out.start = static_cast<std::size_t>(start);
-    out.end = static_cast<std::size_t>(end);
-    return RangeResult::Ok;
-}
-
-// Does an `Accept-Encoding` header list gzip with a non-zero quality?
-//
-// Only the gzip entry's own q-value matters here; `gzip;q=0` means "do not
-// send me gzip" and must be honored.
-inline bool accepts_gzip(const std::string& accept_encoding) {
-    const std::string lowered = to_lower(accept_encoding);
-    std::size_t pos = 0;
-    while (pos < lowered.size()) {
-        std::size_t comma = lowered.find(',', pos);
-        if (comma == std::string::npos) {
-            comma = lowered.size();
-        }
-        std::string entry = lowered.substr(pos, comma - pos);
-        pos = comma + 1;
-
-        // Split "<coding>[;q=<value>]" and trim both halves.
-        const std::size_t semi = entry.find(';');
-        std::string coding = entry.substr(0, semi);
-        std::string params = semi == std::string::npos ? std::string{} : entry.substr(semi + 1);
-        const auto trim = [](std::string& s) {
-            while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(s.begin());
-            while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
-        };
-        trim(coding);
-        trim(params);
-        if (coding != "gzip") {
-            continue;
-        }
-
-        const std::size_t q = params.find("q=");
-        if (q == std::string::npos) {
-            return true;  // no q-value means q=1
-        }
-        return std::strtod(params.c_str() + q + 2, nullptr) > 0.0;
-    }
-    return false;
-}
-
-inline bool wants_keep_alive(const std::string& version, const std::string& connection_header) {
-    const std::string connection = to_lower(connection_header);
-    if (version == "HTTP/1.1") {
-        return connection != "close";
-    }
-    if (version == "HTTP/1.0") {
-        return connection == "keep-alive";
-    }
-    return false;
-}
-
-// Parse request-line + headers from the raw buffer; body may still be incomplete.
-inline Request parse_request_headers(const std::string& raw) {
-    Request request;
-    const std::size_t header_end = raw.find("\r\n\r\n");
-    const std::string header_block = header_end == std::string::npos ? raw : raw.substr(0, header_end);
-
-    std::istringstream stream(header_block);
-    stream >> request.method >> request.target >> request.version;
-
-    const std::size_t query_start = request.target.find('?');
-    request.path = url_decode(request.target.substr(0, query_start));
-    if (query_start != std::string::npos) {
-        request.query = parse_query(request.target.substr(query_start + 1));
-    }
-    if (request.path.empty()) {
-        request.path = "/";
-    }
-
-    std::string line;
-    std::getline(stream, line);  // consume rest of request line
-    while (std::getline(stream, line)) {
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
-        if (line.empty()) {
-            break;
-        }
-        const std::size_t colon = line.find(':');
-        if (colon == std::string::npos) {
-            continue;
-        }
-        std::string key = to_lower(line.substr(0, colon));
-        std::string value = line.substr(colon + 1);
-        while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
-            value.erase(value.begin());
-        }
-        request.headers[key] = value;
-    }
-
-    if (header_end != std::string::npos && header_end + 4 < raw.size()) {
-        request.body = raw.substr(header_end + 4);
-    }
-    return request;
-}
-
-inline bool request_line_valid(const Request& request) {
-    return !request.method.empty() && !request.target.empty() &&
-           request.version.size() == 8 && request.version.compare(0, 7, "HTTP/1.") == 0 &&
-           request.version[7] >= '0' && request.version[7] <= '9';
-}
-
-// Pure parser over an in-memory buffer. On Complete, `request` holds exactly one
-// request and `leftover` receives any pipelined bytes that followed it.
-inline ParseState try_parse_request(const std::string& raw, Request& request, std::string& leftover,
-                                    std::size_t max_body_bytes = kMaxBodyBytes) {
-    const std::size_t header_end = raw.find("\r\n\r\n");
-    if (header_end == std::string::npos) {
-        return raw.size() > kMaxHeaderBytes ? ParseState::HeadersTooLarge : ParseState::NeedMore;
-    }
-    if (header_end > kMaxHeaderBytes) {
-        return ParseState::HeadersTooLarge;
-    }
-
-    request = parse_request_headers(raw);
-    if (!request_line_valid(request)) {
-        return ParseState::Malformed;
-    }
-
-    const ContentLengthInfo info = classify_content_length(request.headers, max_body_bytes);
-    if (info.status == ContentLengthClass::Malformed) {
-        return ParseState::Malformed;
-    }
-    if (info.status == ContentLengthClass::TooLarge) {
-        return ParseState::BodyTooLarge;
-    }
-
-    if (request.body.size() < info.length) {
-        return ParseState::NeedMore;
-    }
-    if (request.body.size() > info.length) {
-        leftover = request.body.substr(info.length);
-        request.body.resize(info.length);
-    }
-    return ParseState::Complete;
-}
-
-// Read one full HTTP request (headers + Content-Length body) off the socket.
-// `leftover` carries unconsumed bytes between pipelined keep-alive requests:
-// it seeds this read and receives any over-read bytes for the next one.
-//
-// Two wall-clock limits bound the read (both enforced with poll(), so a
-// client dripping bytes cannot reset them the way it can reset SO_RCVTIMEO):
-//   - idle_timeout: max silence between bytes. Expiring with no request bytes
-//     is a quiet keep-alive close (Closed); mid-request it is a Timeout (408).
-//   - request_deadline: max total time for the whole request, regardless of
-//     how steadily bytes trickle in. Always Timeout when bytes were received.
-inline ReadResult read_http_request(
-    int client_fd, Request& request, std::string& leftover,
-    std::size_t max_body_bytes = kMaxBodyBytes,
-    std::chrono::milliseconds idle_timeout = kIdleTimeoutDefault,
-    std::chrono::milliseconds request_deadline = kRequestDeadlineDefault) {
-    using clock = std::chrono::steady_clock;
-    std::string raw = std::move(leftover);
-    leftover.clear();
-    char buffer[4096];
-    const clock::time_point start = clock::now();
-
-    while (true) {
-        switch (try_parse_request(raw, request, leftover, max_body_bytes)) {
-            case ParseState::Complete: return ReadResult::Ok;
-            case ParseState::Malformed: return ReadResult::Malformed;
-            case ParseState::HeadersTooLarge: return ReadResult::HeadersTooLarge;
-            case ParseState::BodyTooLarge: return ReadResult::BodyTooLarge;
-            case ParseState::NeedMore: break;
-        }
-
-        const auto elapsed =
-            std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - start);
-        if (elapsed >= request_deadline) {
-            return raw.empty() ? ReadResult::Closed : ReadResult::Timeout;
-        }
-        std::chrono::milliseconds wait = request_deadline - elapsed;
-        if (idle_timeout < wait) {
-            wait = idle_timeout;
-        }
-
-        pollfd read_poll{};
-        read_poll.fd = client_fd;
-        read_poll.events = POLLIN;
-        const int ready = ::poll(&read_poll, 1, static_cast<int>(wait.count()));
-        if (ready == 0) {
-            // Silence for the whole window: idle keep-alive expiry (quiet
-            // close) or a stalled partial request (408 material).
-            return raw.empty() ? ReadResult::Closed : ReadResult::Timeout;
-        }
-        if (ready < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return ReadResult::Closed;
-        }
-
-        const ssize_t received = ::recv(client_fd, buffer, sizeof(buffer), 0);
-        if (received == 0) {
-            return ReadResult::Closed;
-        }
-        if (received < 0) {
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
-                continue;  // spurious wakeup; the deadline math above still governs
-            }
-            return ReadResult::Closed;
-        }
-        raw.append(buffer, static_cast<std::size_t>(received));
-    }
-}
-
-inline Response json_response(const std::string& body, int status = 200, const std::string& status_text = "OK") {
-    return Response{status, status_text, "application/json; charset=utf-8", body, true, {}};
-}
-
-inline Response not_found() {
-    return Response{404, "Not Found", "text/plain; charset=utf-8", "404 Not Found\n", true, {}};
-}
-
-inline Response bad_request(const std::string& message) {
-    return Response{400, "Bad Request", "text/plain; charset=utf-8", message + "\n", true, {}};
-}
 
 inline std::string status_text_for(int status) {
     switch (status) {
@@ -440,37 +54,327 @@ inline std::string status_text_for(int status) {
     }
 }
 
-inline Response method_not_allowed() {
-    Response response{405, status_text_for(405), "text/plain; charset=utf-8",
-                      "405 Method Not Allowed\n", true, {}};
-    response.extra_headers.emplace_back("Allow", "GET, HEAD, POST, OPTIONS");
+inline std::string header_get(const Request& request, const std::string& key) {
+    const auto found = request.headers.find(to_lower(key));
+    return found == request.headers.end() ? "" : found->second;
+}
+
+inline bool wants_close(const Request& request) {
+    const std::string connection = to_lower(header_get(request, "connection"));
+    if (connection.find("close") != std::string::npos) {
+        return true;
+    }
+    if (request.version == "HTTP/1.0") {
+        return connection.find("keep-alive") == std::string::npos;
+    }
+    return false;
+}
+
+inline void add_security_headers(Response& response) {
+    response.extra_headers.emplace_back("X-Content-Type-Options", "nosniff");
+    response.extra_headers.emplace_back("Referrer-Policy", "no-referrer");
+    response.extra_headers.emplace_back("X-Frame-Options", "DENY");
+    response.extra_headers.emplace_back("Access-Control-Allow-Origin", "*");
+    response.extra_headers.emplace_back("Access-Control-Allow-Methods",
+                                        "GET, HEAD, POST, OPTIONS");
+    response.extra_headers.emplace_back("Access-Control-Allow-Headers", "Content-Type, Range");
+    response.extra_headers.emplace_back("Access-Control-Max-Age", "86400");
+    response.extra_headers.emplace_back("Access-Control-Expose-Headers",
+                                        "ETag, Last-Modified, Content-Range, Allow");
+}
+
+inline Response make_status(int status, const std::string& body,
+                            const std::string& content_type = "text/plain; charset=utf-8") {
+    Response response;
+    response.status = status;
+    response.status_text = status_text_for(status);
+    response.content_type = content_type;
+    response.body = body;
+    if (!body.empty() && body.back() != '\n' && starts_with(content_type, "text/plain")) {
+        response.body.push_back('\n');
+    }
     return response;
 }
 
-inline Response simple_status(int status) {
-    return Response{status, status_text_for(status), "text/plain; charset=utf-8",
-                    std::to_string(status) + " " + status_text_for(status) + "\n", true, {}};
+inline Response json_ok(const std::string& body) {
+    Response response;
+    response.status = 200;
+    response.status_text = "OK";
+    response.content_type = "application/json; charset=utf-8";
+    response.body = body;
+    return response;
 }
 
-inline bool send_response(int client_fd, Response response, bool keep_alive) {
-    const std::size_t body_size = response.body.size();
-    std::ostringstream payload;
-    payload << "HTTP/1.1 " << response.status << " " << response.status_text << "\r\n";
-    payload << "Content-Type: " << response.content_type << "\r\n";
-    payload << "Content-Length: " << body_size << "\r\n";
-    payload << "Connection: " << (keep_alive ? "keep-alive" : "close") << "\r\n";
-    payload << "X-Content-Type-Options: nosniff\r\n";
-    payload << "Access-Control-Allow-Origin: *\r\n";
-    payload << "Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS\r\n";
-    payload << "Access-Control-Allow-Headers: Content-Type\r\n";
+inline Response bad_request(const std::string& message) {
+    return make_status(400, message);
+}
+
+inline Response not_found() {
+    return make_status(404, "404 Not Found");
+}
+
+inline Response method_not_allowed(const std::string& allow) {
+    Response response = make_status(405, "Method Not Allowed");
+    response.extra_headers.emplace_back("Allow", allow);
+    return response;
+}
+
+inline Response request_timeout() {
+    Response response = make_status(408, "Request Timeout");
+    response.close = true;
+    return response;
+}
+
+inline Response payload_too_large() {
+    Response response = make_status(413, "Payload Too Large");
+    response.close = true;
+    return response;
+}
+
+inline Response too_many_requests() {
+    Response response = make_status(429, "Too Many Requests");
+    response.extra_headers.emplace_back("Retry-After", "1");
+    return response;
+}
+
+inline Response headers_too_large() {
+    Response response = make_status(431, "Request Header Fields Too Large");
+    response.close = true;
+    return response;
+}
+
+inline Response internal_error() {
+    return make_status(500, "Internal Server Error");
+}
+
+inline Response service_unavailable() {
+    Response response = make_status(503, "Service Unavailable");
+    response.extra_headers.emplace_back("Retry-After", "1");
+    response.close = true;
+    return response;
+}
+
+inline Response cors_preflight() {
+    Response response;
+    response.status = 204;
+    response.status_text = "No Content";
+    response.content_type = "text/plain; charset=utf-8";
+    return response;
+}
+
+inline std::string mime_type(const fs::path& path) {
+    const std::string ext = to_lower(path.extension().string());
+    if (ext == ".html") return "text/html; charset=utf-8";
+    if (ext == ".css") return "text/css; charset=utf-8";
+    if (ext == ".js") return "application/javascript; charset=utf-8";
+    if (ext == ".json") return "application/json; charset=utf-8";
+    if (ext == ".svg") return "image/svg+xml";
+    if (ext == ".png") return "image/png";
+    if (ext == ".jpg" || ext == ".jpeg") return "image/jpeg";
+    if (ext == ".ico") return "image/x-icon";
+    if (ext == ".wasm") return "application/wasm";
+    if (ext == ".map") return "application/json";
+    if (ext == ".txt") return "text/plain; charset=utf-8";
+    return "application/octet-stream";
+}
+
+inline bool send_all(int fd, const char* data, std::size_t size, int timeout_ms = 15000) {
+    std::size_t offset = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (offset < size) {
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+        if (remaining.count() <= 0) {
+            return false;
+        }
+        pollfd item{};
+        item.fd = fd;
+        item.events = POLLOUT;
+        const int ready = ::poll(&item, 1, static_cast<int>(remaining.count()));
+        if (ready <= 0) {
+            return false;
+        }
+        if (item.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            return false;
+        }
+        const ssize_t sent = ::send(fd, data + offset, size - offset, 0);
+        if (sent < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+            return false;
+        }
+        if (sent == 0) {
+            return false;
+        }
+        offset += static_cast<std::size_t>(sent);
+    }
+    return true;
+}
+
+inline bool send_all(int fd, const std::string& payload, int timeout_ms = 15000) {
+    return send_all(fd, payload.data(), payload.size(), timeout_ms);
+}
+
+inline std::string serialize_response(const Request& request, const Response& response,
+                                      bool keep_alive) {
+    const bool head = request.method == "HEAD";
+    const bool no_body = head || response.status == 204 || response.status == 304;
+    std::ostringstream out;
+    out << "HTTP/1.1 " << response.status << " " << response.status_text << "\r\n";
+    out << "Date: " << http_date() << "\r\n";
+    out << "Server: AsterForge/" << kVersion << "\r\n";
+    const bool event_stream = response.content_type.find("event-stream") != std::string::npos;
+    if (!response.content_type.empty() && response.status != 204) {
+        out << "Content-Type: " << response.content_type << "\r\n";
+    }
+    if (event_stream) {
+        // SSE is an open stream; a Content-Length of 0 would truncate it.
+    } else if (response.status != 204 && response.status != 304) {
+        out << "Content-Length: " << response.body.size() << "\r\n";
+    } else if (response.status == 304) {
+        out << "Content-Length: 0\r\n";
+    }
+    const bool close = response.close || !keep_alive;
+    out << "Connection: " << (close ? "close" : "keep-alive") << "\r\n";
+    if (!close) {
+        out << "Keep-Alive: timeout=8, max=64\r\n";
+    }
+    bool has_cache = false;
+    bool has_cors = false;
     for (const auto& header : response.extra_headers) {
-        payload << header.first << ": " << header.second << "\r\n";
+        if (to_lower(header.first) == "cache-control") {
+            has_cache = true;
+        }
+        if (to_lower(header.first) == "access-control-allow-origin") {
+            has_cors = true;
+        }
+        out << header.first << ": " << header.second << "\r\n";
     }
-    payload << "\r\n";
-    if (response.include_body) {
-        payload << response.body;
+    if (!has_cache) {
+        out << "Cache-Control: no-store\r\n";
     }
-    return send_all(client_fd, payload.str());
+    if (!has_cors) {
+        out << "X-Content-Type-Options: nosniff\r\n";
+        out << "Referrer-Policy: no-referrer\r\n";
+        out << "X-Frame-Options: DENY\r\n";
+        out << "Access-Control-Allow-Origin: *\r\n";
+        out << "Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS\r\n";
+        out << "Access-Control-Allow-Headers: Content-Type, Range\r\n";
+        out << "Access-Control-Expose-Headers: ETag, Last-Modified, Content-Range, Allow\r\n";
+    }
+    out << "\r\n";
+    if (!no_body) {
+        out << response.body;
+    }
+    return out.str();
+}
+
+enum class ParseStatus { complete, incomplete, bad, headers_too_large, body_too_large };
+
+struct ParseOutcome {
+    ParseStatus status = ParseStatus::incomplete;
+    Request request;
+    std::size_t consumed = 0;
+};
+
+inline ParseOutcome try_parse_request(const std::string& buffer, std::size_t max_headers,
+                                      std::size_t max_body) {
+    ParseOutcome outcome;
+    const std::size_t header_end = buffer.find("\r\n\r\n");
+    if (header_end == std::string::npos) {
+        if (buffer.size() > max_headers) {
+            outcome.status = ParseStatus::headers_too_large;
+        }
+        return outcome;
+    }
+    if (header_end > max_headers) {
+        outcome.status = ParseStatus::headers_too_large;
+        return outcome;
+    }
+
+    const std::string head = buffer.substr(0, header_end);
+    const std::size_t line_end = head.find("\r\n");
+    const std::string request_line = line_end == std::string::npos ? head : head.substr(0, line_end);
+    std::istringstream line(request_line);
+    Request request;
+    line >> request.method >> request.target >> request.version;
+    if (request.method.empty() || request.target.empty() || request.version.empty()) {
+        outcome.status = ParseStatus::bad;
+        return outcome;
+    }
+    if (request.target.size() > 8192) {
+        outcome.status = ParseStatus::bad;
+        return outcome;
+    }
+
+    const std::size_t query_start = request.target.find('?');
+    request.path = url_decode(request.target.substr(0, query_start));
+    if (query_start != std::string::npos) {
+        request.query = parse_query(request.target.substr(query_start + 1));
+    }
+    if (request.path.empty()) {
+        request.path = "/";
+    }
+
+    std::size_t cursor = line_end == std::string::npos ? head.size() : line_end + 2;
+    while (cursor < head.size()) {
+        const std::size_t next = head.find("\r\n", cursor);
+        const std::string raw =
+            head.substr(cursor, next == std::string::npos ? std::string::npos : next - cursor);
+        if (raw.empty()) {
+            break;
+        }
+        const std::size_t colon = raw.find(':');
+        if (colon == std::string::npos) {
+            outcome.status = ParseStatus::bad;
+            return outcome;
+        }
+        const std::string key = to_lower(trim(raw.substr(0, colon)));
+        const std::string value = trim(raw.substr(colon + 1));
+        request.headers[key] = value;
+        if (next == std::string::npos) {
+            break;
+        }
+        cursor = next + 2;
+        if (request.headers.size() > 100) {
+            outcome.status = ParseStatus::headers_too_large;
+            return outcome;
+        }
+    }
+
+    std::size_t content_length = 0;
+    const std::string length_header = header_get(request, "content-length");
+    if (!length_header.empty()) {
+        try {
+            if (length_header.find('-') != std::string::npos) {
+                outcome.status = ParseStatus::bad;
+                return outcome;
+            }
+            const unsigned long long parsed = std::stoull(length_header);
+            if (parsed > max_body) {
+                outcome.status = ParseStatus::body_too_large;
+                outcome.request = request;
+                return outcome;
+            }
+            content_length = static_cast<std::size_t>(parsed);
+        } catch (...) {
+            outcome.status = ParseStatus::bad;
+            return outcome;
+        }
+    }
+
+    const std::size_t total = header_end + 4 + content_length;
+    if (buffer.size() < total) {
+        outcome.status = ParseStatus::incomplete;
+        outcome.request = request;
+        return outcome;
+    }
+    request.body = buffer.substr(header_end + 4, content_length);
+    outcome.status = ParseStatus::complete;
+    outcome.request = std::move(request);
+    outcome.consumed = total;
+    return outcome;
 }
 
 }  // namespace aster
